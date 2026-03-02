@@ -1,7 +1,7 @@
 {
   "timezone": "Asia/Seoul",
-  "channelId": "C0AD59WG6PJ",
-  "schedule": "0 11 * * 1,2,5",
+  "channelId": "C0ACJCNQVK6",
+  "schedule": "0 9 * * 1,2,5",
   "messages": {
     "monday": "아쉬탕가 @ 11:30, 4층 Idea Hub",
     "tuesday": "하타 @ 11:30, 4층 Idea Hub",
