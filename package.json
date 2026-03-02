@@ -1,0 +1,20 @@
+{
+  "name": "yoga-slack-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@slack/bolt": "^4.6.0",
+    "dotenv": "^17.2.3",
+    "googleapis": "^140.0.0",
+    "node-cron": "^3.0.3"
+  }
+}
