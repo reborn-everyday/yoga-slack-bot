@@ -52,3 +52,27 @@ docker compose logs -f yoga-slack-bot
 ```bash
 docker compose down
 ```
+
+## 7) 스케줄 설정 (yoga-schedule.json)
+
+스케줄 및 메시지는 `yoga-schedule.json`에서 관리합니다. **재빌드 없이** 즉시 반영됩니다 (cron 실행 시마다 파일을 재로드).
+
+| 필드 | 설명 |
+|------|------|
+| `channelId` | 프로덕션 채널 ID (자동 발송 대상) |
+| `testChannelId` | 테스트 채널 ID (`/yoga test` 수동 발송 대상) |
+| `schedule` | cron 표현식 (기본: `0 9 * * 1,2,4` → 매주 월/화/목 오전 9시) |
+| `messages` | 요일별 메시지 내용 (`monday`, `tuesday`, `thursday` 키 사용) |
+
+## 8) 테스트 메시지 발송
+
+슬랙 커맨드로 테스트 채널에 즉시 메시지를 보낼 수 있습니다:
+
+| 커맨드 | 동작 |
+|--------|------|
+| `/yoga test` | 오늘 요일 메시지를 테스트 채널로 발송 |
+| `/yoga test monday` | 월요일 메시지 발송 |
+| `/yoga test tuesday` | 화요일 메시지 발송 |
+| `/yoga test thursday` | 목요일 메시지 발송 |
+
+`yoga-schedule.json`의 `testChannelId`가 설정되어 있어야 동작합니다.

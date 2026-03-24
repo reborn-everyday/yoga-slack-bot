@@ -351,8 +351,52 @@ app.command("/yoga", async ({ command, ack, respond }) => {
     return;
   }
 
+  if (text.startsWith("test")) {
+    const config = loadScheduleConfig();
+    const testChannel = config.testChannelId;
+    if (!testChannel) {
+      await respond({
+        text: "`yoga-schedule.json`에 `testChannelId`를 설정해 주세요.",
+        response_type: "ephemeral",
+      });
+      return;
+    }
+
+    const args = text.split(/\s+/);
+    const dayArg = args[1];
+    let day;
+    if (dayArg) {
+      day = dayArg.toLowerCase();
+    } else {
+      const tz = config.timezone || SCHEDULE_TZ;
+      day = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" })
+        .format(new Date())
+        .toLowerCase();
+    }
+
+    const detail = (config.messages || {})[day];
+    if (!detail) {
+      await respond({
+        text: `\`${day}\`에 설정된 메시지가 없습니다. (monday/tuesday/thursday 중 하나를 입력하세요)`,
+        response_type: "ephemeral",
+      });
+      return;
+    }
+
+    await app.client.chat.postMessage({
+      channel: testChannel,
+      text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
+      blocks: buildOpenBlocks(detail),
+    });
+    await respond({
+      text: `테스트 메시지를 발송했습니다. (${day} / <#${testChannel}>)`,
+      response_type: "ephemeral",
+    });
+    return;
+  }
+
   await respond({
-    text: "사용법: `/yoga open <시간> <클래스>` (버튼으로 참여)",
+    text: "사용법: `/yoga open <시간> <클래스>` (버튼으로 참여)\n테스트: `/yoga test [monday|tuesday|thursday]`",
     response_type: "ephemeral",
   });
 });
