@@ -1,0 +1,12 @@
+services:
+  yoga-slack-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yoga-slack-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      SCHEDULE_CONFIG_PATH: /app/yoga-schedule.json

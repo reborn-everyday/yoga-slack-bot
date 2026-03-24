@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js",
+    "start": "node index.js",
+    "start:insecure": "NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
