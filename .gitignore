@@ -4,3 +4,4 @@ node_modules/
 wellness-architect-485214-800886c92a64.json
 *.out
 secrets/
+.codex

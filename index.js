@@ -17,6 +17,38 @@ const SCHEDULE_CONFIG_PATH = process.env.SCHEDULE_CONFIG_PATH || "./yoga-schedul
 const SHEETS_SPREADSHEET_ID = process.env.GOOGLE_SHEETS_ID;
 const SHEETS_RANGE = process.env.GOOGLE_SHEETS_RANGE || "Attendance!A:E";
 
+// Tracks active announcement messages so we can update them in-place
+// key: "channel:date" (e.g. "C123:2026-03-31"), value: { ts, channel, detail }
+const ANNOUNCEMENTS_FILE = process.env.ANNOUNCEMENTS_FILE || "./data/active-announcements.json";
+const activeAnnouncements = new Map();
+
+function loadAnnouncements() {
+  try {
+    const data = JSON.parse(fs.readFileSync(ANNOUNCEMENTS_FILE, "utf8"));
+    for (const [key, value] of Object.entries(data)) {
+      activeAnnouncements.set(key, value);
+    }
+  } catch (_) {
+    // File doesn't exist yet or is invalid — start fresh
+  }
+}
+
+function saveAnnouncements() {
+  const data = Object.fromEntries(activeAnnouncements);
+  fs.writeFileSync(ANNOUNCEMENTS_FILE, JSON.stringify(data, null, 2));
+}
+
+function setAnnouncement(channel, date, value) {
+  activeAnnouncements.set(`${channel}:${date}`, value);
+  saveAnnouncements();
+}
+
+function getAnnouncement(channel, date) {
+  return activeAnnouncements.get(`${channel}:${date}`);
+}
+
+loadAnnouncements();
+
 function getServiceAccountCredentials() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   if (raw) {
@@ -229,6 +261,33 @@ async function deleteAttendance({ date, userId }) {
   return true;
 }
 
+async function getAttendeesForDate(date) {
+  if (!SHEETS_SPREADSHEET_ID) return [];
+  const sheets = await getSheetsClient();
+
+  const sheetName = SHEETS_RANGE.split("!")[0] || "Attendance";
+  const valuesResp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEETS_SPREADSHEET_ID,
+    range: `${sheetName}!A:ZZ`,
+  });
+  const values = valuesResp.data.values || [];
+  const header = values[0] || [];
+  const headerMap = resolveHeaderMap(header);
+
+  const attendees = [];
+  for (let i = 1; i < values.length; i += 1) {
+    const row = values[i] || [];
+    const rowDate = headerMap.date !== undefined ? row[headerMap.date] : row[0];
+    const rowUserId = headerMap.userId !== undefined ? row[headerMap.userId] : row[1];
+    const rowUserName = headerMap.userName !== undefined ? row[headerMap.userName] : row[2];
+    const rowStatus = headerMap.status !== undefined ? row[headerMap.status] : row[3];
+    if (rowDate === date && (rowStatus === "attend" || rowStatus === "late")) {
+      attendees.push({ userId: rowUserId, userName: rowUserName, status: rowStatus });
+    }
+  }
+  return attendees;
+}
+
 function buildInterestBlocks() {
   return [
     {
@@ -320,6 +379,48 @@ function buildOpenBlocks(detail) {
   ];
 }
 
+function buildOpenBlocksWithAttendees(detail, attendees) {
+  const blocks = buildOpenBlocks(detail);
+
+  let text;
+  if (attendees.length === 0) {
+    text = "*참석자:* 아직 없음";
+  } else {
+    const names = attendees.map((a) => {
+      const mention = `<@${a.userId}>`;
+      return a.status === "late" ? `${mention}(늦참)` : mention;
+    });
+    text = `*참석자 (${attendees.length}명):* ${names.join(", ")}`;
+  }
+
+  blocks.splice(1, 0, {
+    type: "context",
+    elements: [{ type: "mrkdwn", text }],
+  });
+  return blocks;
+}
+
+async function updateAnnouncementWithAttendees(client, channel, date) {
+  const announcement = getAnnouncement(channel, date);
+  if (!announcement) {
+    console.warn("No active announcement found for", channel, date);
+    return;
+  }
+
+  try {
+    const attendees = await getAttendeesForDate(date);
+    const blocks = buildOpenBlocksWithAttendees(announcement.detail, attendees);
+    await client.chat.update({
+      channel: announcement.channel,
+      ts: announcement.ts,
+      text: `🧘 *[요가무리 클래스 오픈]*\n>${announcement.detail}`,
+      blocks,
+    });
+  } catch (err) {
+    console.error("Failed to update announcement:", err);
+  }
+}
+
 function loadScheduleConfig() {
   const raw = fs.readFileSync(SCHEDULE_CONFIG_PATH, "utf8");
   return JSON.parse(raw);
@@ -343,11 +444,13 @@ app.command("/yoga", async ({ command, ack, respond }) => {
 
   if (text.startsWith("open")) {
     const detail = text.replace("open", "").trim();
-    await respond({
+    const result = await app.client.chat.postMessage({
+      channel: command.channel_id,
       text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-      blocks: buildOpenBlocks(detail),
-      response_type: "in_channel",
+      blocks: buildOpenBlocksWithAttendees(detail, []),
     });
+    const date = getDateString(SCHEDULE_TZ);
+    setAnnouncement(command.channel_id, date, { ts: result.ts, channel: command.channel_id, detail });
     return;
   }
 
@@ -383,11 +486,13 @@ app.command("/yoga", async ({ command, ack, respond }) => {
       return;
     }
 
-    await app.client.chat.postMessage({
+    const result = await app.client.chat.postMessage({
       channel: testChannel,
       text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-      blocks: buildOpenBlocks(detail),
+      blocks: buildOpenBlocksWithAttendees(detail, []),
     });
+    const date = getDateString(SCHEDULE_TZ);
+    setAnnouncement(testChannel, date, { ts: result.ts, channel: testChannel, detail });
     await respond({
       text: `테스트 메시지를 발송했습니다. (${day} / <#${testChannel}>)`,
       response_type: "ephemeral",
@@ -435,6 +540,7 @@ async function handleAttendanceAction({ ack, body, client, status }) {
       blocks: buildCancelBlocks(),
       text: "참석 등록이 완료됐어요.",
     });
+    await updateAnnouncementWithAttendees(client, channelId, date);
   } catch (err) {
     await client.chat.postEphemeral({
       channel: channelId,
@@ -466,6 +572,7 @@ app.action("yoga_cancel", async ({ ack, body, client }) => {
       user: user.id,
       text: removed ? "취소가 완료됐어요." : "이미 취소되었거나 신청 내역이 없어요.",
     });
+    if (removed) await updateAnnouncementWithAttendees(client, channelId, date);
   } catch (err) {
     await client.chat.postEphemeral({
       channel: channelId,
@@ -499,11 +606,13 @@ app.action("yoga_cancel", async ({ ack, body, client }) => {
           console.warn("⚠️ No scheduled message for today.");
           return;
         }
-        await app.client.chat.postMessage({
+        const result = await app.client.chat.postMessage({
           channel,
           text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-          blocks: buildOpenBlocks(detail),
+          blocks: buildOpenBlocksWithAttendees(detail, []),
         });
+        const date = getDateString(tz);
+        setAnnouncement(channel, date, { ts: result.ts, channel, detail });
       } catch (err) {
         console.error("Failed to post scheduled yoga message:", err);
       }
