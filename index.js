@@ -1,53 +1,79 @@
 require("dotenv").config();
-const fs = require("fs");
-const { App } = require("@slack/bolt");
-const cron = require("node-cron");
-const { google } = require("googleapis");
 
-// Socket Mode로 실행 (개발/초기 MVP에 최적)   [oai_citation:7‡docs.slack.dev](https://docs.slack.dev/apis/events-api/using-socket-mode?utm_source=chatgpt.com)
+const crypto = require("crypto");
+const fs = require("fs");
+const cron = require("node-cron");
+const { App } = require("@slack/bolt");
+
+const { AnnouncementStore } = require("./src/announcement-store");
+const {
+  buildAttendBlocks,
+  buildCancelBlocks,
+  buildOpenBlocksWithAttendees,
+  decodeAnnouncementContext,
+} = require("./src/announcement-ui");
+const { renderAdminPage } = require("./src/admin-page");
+const { AdminSessionStore, startAdminServer } = require("./src/admin-server");
+const { AttendanceService } = require("./src/attendance-service");
+const { ScheduleRegistry } = require("./src/schedule-registry");
+const { ScheduleStore, describeSchedule } = require("./src/schedule-store");
+const { logStartupWarnings } = require("./src/startup-warnings");
+const {
+  ACTION_IDS,
+  BLOCK_IDS,
+  CALLBACK_IDS,
+  buildAddScheduleModalView,
+  buildAdminHomeView,
+  buildScheduleAdminModalView,
+  buildTestPickerModalView,
+  extractScheduleDraftFromState,
+  extractScheduleFormValues,
+  extractTestScheduleSelection,
+  isAdminUser,
+  parseAdminUserIds,
+} = require("./src/slack-admin");
+const { getDateString } = require("./src/utils");
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
 });
 
-const SCHEDULE_TZ = process.env.SCHEDULE_TZ || "Asia/Seoul";
-const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
-const SCHEDULE_CONFIG_PATH = process.env.SCHEDULE_CONFIG_PATH || "./yoga-schedule.json";
+const DEFAULT_TIMEZONE = process.env.SCHEDULE_TZ || "Asia/Seoul";
+const PRODUCTION_CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
+const TEST_CHANNEL_ID = process.env.SLACK_TEST_CHANNEL_ID;
+const SCHEDULE_STORE_PATH = process.env.SCHEDULE_STORE_PATH || "./data/schedules.json";
+const SCHEDULE_SEED_PATH = process.env.SCHEDULE_SEED_PATH || "./config/schedules.seed.json";
+const ANNOUNCEMENTS_FILE = process.env.ANNOUNCEMENTS_FILE || "./data/active-announcements.json";
 const SHEETS_SPREADSHEET_ID = process.env.GOOGLE_SHEETS_ID;
 const SHEETS_RANGE = process.env.GOOGLE_SHEETS_RANGE || "Attendance!A:E";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_UI_PORT = Number(process.env.ADMIN_UI_PORT || "8400");
+const ADMIN_USER_IDS = parseAdminUserIds(process.env.SCHEDULE_ADMIN_USER_IDS || "");
 
-// Tracks active announcement messages so we can update them in-place
-// key: "channel:date" (e.g. "C123:2026-03-31"), value: { ts, channel, detail }
-const ANNOUNCEMENTS_FILE = process.env.ANNOUNCEMENTS_FILE || "./data/active-announcements.json";
-const activeAnnouncements = new Map();
+const announcementStore = new AnnouncementStore({ filePath: ANNOUNCEMENTS_FILE });
+announcementStore.initialize();
 
-function loadAnnouncements() {
-  try {
-    const data = JSON.parse(fs.readFileSync(ANNOUNCEMENTS_FILE, "utf8"));
-    for (const [key, value] of Object.entries(data)) {
-      activeAnnouncements.set(key, value);
-    }
-  } catch (_) {
-    // File doesn't exist yet or is invalid — start fresh
-  }
-}
+const scheduleStore = new ScheduleStore({
+  filePath: SCHEDULE_STORE_PATH,
+  seedPath: SCHEDULE_SEED_PATH,
+  defaultTimezone: DEFAULT_TIMEZONE,
+});
 
-function saveAnnouncements() {
-  const data = Object.fromEntries(activeAnnouncements);
-  fs.writeFileSync(ANNOUNCEMENTS_FILE, JSON.stringify(data, null, 2));
-}
+const attendanceService = new AttendanceService({
+  spreadsheetId: SHEETS_SPREADSHEET_ID,
+  range: SHEETS_RANGE,
+  defaultTimezone: DEFAULT_TIMEZONE,
+  credentialsLoader: getServiceAccountCredentials,
+});
 
-function setAnnouncement(channel, date, value) {
-  activeAnnouncements.set(`${channel}:${date}`, value);
-  saveAnnouncements();
-}
-
-function getAnnouncement(channel, date) {
-  return activeAnnouncements.get(`${channel}:${date}`);
-}
-
-loadAnnouncements();
+const scheduleRegistry = new ScheduleRegistry({
+  cronLib: cron,
+  onTrigger: async (schedule) => {
+    await postSavedSchedule(schedule);
+  },
+});
 
 function getServiceAccountCredentials() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -56,7 +82,7 @@ function getServiceAccountCredentials() {
     if (trimmed.startsWith("{")) return JSON.parse(trimmed);
     try {
       return JSON.parse(Buffer.from(trimmed, "base64").toString("utf8"));
-    } catch (err) {
+    } catch (_) {
       throw new Error("GOOGLE_SERVICE_ACCOUNT_KEY must be JSON or base64-encoded JSON.");
     }
   }
@@ -69,483 +95,307 @@ function getServiceAccountCredentials() {
   throw new Error("Missing Google service account credentials.");
 }
 
-function getDateString(tz) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
+function resolveScheduleChannel(target) {
+  if (target === "test") return TEST_CHANNEL_ID;
+  return PRODUCTION_CHANNEL_ID;
 }
 
-function getTimestampString(tz) {
-  return new Intl.DateTimeFormat("sv-SE", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(new Date());
+function getDecoratedSchedules() {
+  return scheduleStore.list().map((schedule) => describeSchedule(schedule, resolveScheduleChannel));
 }
 
-function columnNumberToLetter(num) {
-  let n = num;
-  let letters = "";
-  while (n > 0) {
-    const rem = (n - 1) % 26;
-    letters = String.fromCharCode(65 + rem) + letters;
-    n = Math.floor((n - 1) / 26);
-  }
-  return letters || "A";
-}
-
-function normalizeHeader(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function resolveHeaderMap(headerRow) {
-  const map = {};
-  const aliases = {
-    date: ["date", "날짜", "일자"],
-    userId: ["userid", "user_id", "user id", "사용자id", "유저id", "슬랙id", "slack id"],
-    userName: ["username", "user_name", "user name", "이름", "닉네임", "유저명", "사용자명"],
-    status: ["status", "상태", "참석", "구분"],
-    timestamp: ["timestamp", "time", "시간", "등록시간", "기록시간"],
+function createManualAnnouncementContext(detail) {
+  return {
+    scheduleId: `manual:${crypto.randomUUID()}`,
+    occurrenceDate: getDateString(DEFAULT_TIMEZONE),
+    jobName: detail || "Manual yoga open",
+    timezone: DEFAULT_TIMEZONE,
   };
-
-  headerRow.forEach((cell, index) => {
-    const normalized = normalizeHeader(cell);
-    if (!normalized) return;
-    for (const [key, list] of Object.entries(aliases)) {
-      if (list.includes(normalized)) {
-        map[key] = index;
-      }
-    }
-  });
-
-  return map;
 }
 
-async function getSheetsClient() {
-  const credentials = getServiceAccountCredentials();
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  return google.sheets({ version: "v4", auth });
-}
-
-async function appendAttendance({ date, userId, userName, status }) {
-  if (!SHEETS_SPREADSHEET_ID) throw new Error("Missing GOOGLE_SHEETS_ID.");
-  const sheets = await getSheetsClient();
-  const timestamp = getTimestampString(SCHEDULE_TZ);
-
-  const sheetName = SHEETS_RANGE.split("!")[0] || "Attendance";
-  const valuesResp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
-    range: `${sheetName}!A:ZZ`,
-  });
-  const values = valuesResp.data.values || [];
-  const header = values[0] || [];
-  const headerMap = resolveHeaderMap(header);
-
-  const totalColumns = Math.max(header.length || 0, 5);
-  const lastColLetter = columnNumberToLetter(totalColumns);
-
-  const makeRow = () => {
-    const row = Array(totalColumns).fill("");
-    if (headerMap.date !== undefined) row[headerMap.date] = date;
-    if (headerMap.userId !== undefined) row[headerMap.userId] = userId;
-    if (headerMap.userName !== undefined) row[headerMap.userName] = userName;
-    if (headerMap.status !== undefined) row[headerMap.status] = status;
-    if (headerMap.timestamp !== undefined) row[headerMap.timestamp] = timestamp;
-    if (headerMap.date === undefined) row[0] = date;
-    if (headerMap.userId === undefined) row[1] = userId;
-    if (headerMap.userName === undefined) row[2] = userName;
-    if (headerMap.status === undefined) row[3] = status;
-    if (headerMap.timestamp === undefined) row[4] = timestamp;
-    return row;
+function createSavedScheduleContext(schedule) {
+  return {
+    scheduleId: schedule.id,
+    occurrenceDate: getDateString(schedule.timezone),
+    jobName: schedule.name,
+    timezone: schedule.timezone,
   };
+}
 
-  let existingRowIndex = -1;
-  for (let i = 1; i < values.length; i += 1) {
-    const row = values[i] || [];
-    const rowDate = headerMap.date !== undefined ? row[headerMap.date] : row[0];
-    const rowUserId = headerMap.userId !== undefined ? row[headerMap.userId] : row[1];
-    if (rowDate === date && rowUserId === userId) {
-      existingRowIndex = i;
-      break;
-    }
+function createTestScheduleContext(schedule) {
+  return {
+    scheduleId: `test:${schedule.id}`,
+    occurrenceDate: getDateString(schedule.timezone),
+    jobName: `${schedule.name} [test]`,
+    timezone: schedule.timezone,
+  };
+}
+
+async function postAnnouncement({ channel, detail, context }) {
+  const result = await app.client.chat.postMessage({
+    channel,
+    text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
+    blocks: buildOpenBlocksWithAttendees(detail, [], context),
+  });
+
+  announcementStore.set({
+    ...context,
+    channel,
+    detail,
+    ts: result.ts,
+  });
+
+  return result;
+}
+
+async function postSavedSchedule(schedule) {
+  const channel = resolveScheduleChannel(schedule.target);
+  if (!channel) {
+    console.warn(`⚠️ Missing Slack channel for target "${schedule.target}" on schedule ${schedule.id}.`);
+    return null;
   }
 
-  const rowValues = makeRow();
-
-  if (existingRowIndex >= 1) {
-    const rowNumber = existingRowIndex + 1;
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEETS_SPREADSHEET_ID,
-      range: `${sheetName}!A${rowNumber}:${lastColLetter}${rowNumber}`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [rowValues] },
-    });
-    return;
-  }
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
-    range: `${sheetName}!A:${lastColLetter}`,
-    valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [rowValues] },
+  return postAnnouncement({
+    channel,
+    detail: schedule.message,
+    context: createSavedScheduleContext(schedule),
   });
 }
 
-async function deleteAttendance({ date, userId }) {
-  if (!SHEETS_SPREADSHEET_ID) throw new Error("Missing GOOGLE_SHEETS_ID.");
-  const sheets = await getSheetsClient();
-
-  const sheetName = SHEETS_RANGE.split("!")[0] || "Attendance";
-  const valuesResp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
-    range: `${sheetName}!A:ZZ`,
-  });
-  const values = valuesResp.data.values || [];
-  const header = values[0] || [];
-  const headerMap = resolveHeaderMap(header);
-
-  const headerOffset = 1;
-  const rowsToDelete = [];
-  for (let i = headerOffset; i < values.length; i += 1) {
-    const row = values[i] || [];
-    const rowDate = headerMap.date !== undefined ? row[headerMap.date] : row[0];
-    const rowUserId = headerMap.userId !== undefined ? row[headerMap.userId] : row[1];
-    const rowStatus = headerMap.status !== undefined ? row[headerMap.status] : row[3];
-    if (rowDate === date && rowUserId === userId && (rowStatus === "attend" || rowStatus === "late")) {
-      rowsToDelete.push(i);
-    }
+async function postScheduleToTestChannel(schedule) {
+  if (!TEST_CHANNEL_ID) {
+    throw new Error("Missing SLACK_TEST_CHANNEL_ID.");
   }
 
-  if (rowsToDelete.length === 0) return false;
-
-  const spreadsheet = await sheets.spreadsheets.get({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
+  return postAnnouncement({
+    channel: TEST_CHANNEL_ID,
+    detail: schedule.message,
+    context: createTestScheduleContext(schedule),
   });
-  const sheet = (spreadsheet.data.sheets || []).find(
-    (s) => s.properties && s.properties.title === sheetName
-  );
-  if (!sheet || typeof sheet.properties.sheetId !== "number") {
-    throw new Error(`Sheet not found: ${sheetName}`);
-  }
+}
 
-  const requests = rowsToDelete
-    .sort((a, b) => b - a)
-    .map((rowIndex) => ({
-      deleteDimension: {
-        range: {
-          sheetId: sheet.properties.sheetId,
-          dimension: "ROWS",
-          startIndex: rowIndex,
-          endIndex: rowIndex + 1,
-        },
-      },
-    }));
+async function updateAnnouncementWithAttendees(client, context) {
+  const announcement = announcementStore.get(context.scheduleId, context.occurrenceDate);
+  if (!announcement) return;
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
-    requestBody: { requests },
+  const attendees = await attendanceService.getAttendees({
+    occurrenceDate: context.occurrenceDate,
+    scheduleId: context.scheduleId,
   });
 
-  return true;
-}
-
-async function getAttendeesForDate(date) {
-  if (!SHEETS_SPREADSHEET_ID) return [];
-  const sheets = await getSheetsClient();
-
-  const sheetName = SHEETS_RANGE.split("!")[0] || "Attendance";
-  const valuesResp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEETS_SPREADSHEET_ID,
-    range: `${sheetName}!A:ZZ`,
+  await client.chat.update({
+    channel: announcement.channel,
+    ts: announcement.ts,
+    text: `🧘 *[요가무리 클래스 오픈]*\n>${announcement.detail}`,
+    blocks: buildOpenBlocksWithAttendees(announcement.detail, attendees, {
+      scheduleId: announcement.scheduleId,
+      occurrenceDate: announcement.occurrenceDate,
+      jobName: announcement.jobName,
+      timezone: announcement.timezone,
+    }),
   });
-  const values = valuesResp.data.values || [];
-  const header = values[0] || [];
-  const headerMap = resolveHeaderMap(header);
-
-  const attendees = [];
-  for (let i = 1; i < values.length; i += 1) {
-    const row = values[i] || [];
-    const rowDate = headerMap.date !== undefined ? row[headerMap.date] : row[0];
-    const rowUserId = headerMap.userId !== undefined ? row[headerMap.userId] : row[1];
-    const rowUserName = headerMap.userName !== undefined ? row[headerMap.userName] : row[2];
-    const rowStatus = headerMap.status !== undefined ? row[headerMap.status] : row[3];
-    if (rowDate === date && (rowStatus === "attend" || rowStatus === "late")) {
-      attendees.push({ userId: rowUserId, userName: rowUserName, status: rowStatus });
-    }
-  }
-  return attendees;
 }
 
-function buildInterestBlocks() {
-  return [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: "오늘 요가할 사람!" },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "저요!" },
-          action_id: "yoga_interest",
-          value: "interest",
-        },
-      ],
-    },
-  ];
-}
-
-function buildAttendBlocks() {
-  return [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: "오늘 참여 형태를 선택해 주세요." },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "참석" },
-          action_id: "yoga_attend",
-          value: "attend",
-          style: "primary",
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "늦참" },
-          action_id: "yoga_late",
-          value: "late",
-        },
-      ],
-    },
-  ];
-}
-
-function buildCancelBlocks() {
-  return [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: "참석 등록이 완료됐어요." },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "취소" },
-          action_id: "yoga_cancel",
-          value: "cancel",
-          style: "danger",
-        },
-      ],
-    },
-  ];
-}
-
-function buildOpenBlocks(detail) {
-  return [
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `🧘 *오늘 요가할 사람!*\n>${detail}`,
-      },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "저요!" },
-          action_id: "yoga_interest",
-          value: "interest",
-        },
-      ],
-    },
-  ];
-}
-
-function buildOpenBlocksWithAttendees(detail, attendees) {
-  const blocks = buildOpenBlocks(detail);
-
-  let text;
-  if (attendees.length === 0) {
-    text = "*참석자:* 아직 없음";
-  } else {
-    const names = attendees.map((a) => {
-      const mention = `<@${a.userId}>`;
-      return a.status === "late" ? `${mention}(늦참)` : mention;
-    });
-    text = `*참석자 (${attendees.length}명):* ${names.join(", ")}`;
-  }
-
-  blocks.splice(1, 0, {
-    type: "context",
-    elements: [{ type: "mrkdwn", text }],
+async function publishHome(client, userId) {
+  const view = buildAdminHomeView({
+    schedules: getDecoratedSchedules(),
+    authorized: isAdminUser(userId, ADMIN_USER_IDS),
   });
-  return blocks;
+
+  await client.views.publish({
+    user_id: userId,
+    view,
+  });
 }
 
-async function updateAnnouncementWithAttendees(client, channel, date) {
-  const announcement = getAnnouncement(channel, date);
-  if (!announcement) {
-    console.warn("No active announcement found for", channel, date);
-    return;
-  }
+async function refreshAdminModal(client, rootViewId) {
+  if (!rootViewId) return;
 
   try {
-    const attendees = await getAttendeesForDate(date);
-    const blocks = buildOpenBlocksWithAttendees(announcement.detail, attendees);
-    await client.chat.update({
-      channel: announcement.channel,
-      ts: announcement.ts,
-      text: `🧘 *[요가무리 클래스 오픈]*\n>${announcement.detail}`,
-      blocks,
+    await client.views.update({
+      view_id: rootViewId,
+      view: buildScheduleAdminModalView({
+        schedules: getDecoratedSchedules(),
+      }),
     });
-  } catch (err) {
-    console.error("Failed to update announcement:", err);
+  } catch (_) {
+    // Root modal may not be open. That's okay.
   }
 }
 
-function loadScheduleConfig() {
-  const raw = fs.readFileSync(SCHEDULE_CONFIG_PATH, "utf8");
-  return JSON.parse(raw);
+async function refreshAdminSurfaces(client, userId, rootViewId) {
+  const tasks = [publishHome(client, userId)];
+  if (rootViewId) tasks.push(refreshAdminModal(client, rootViewId));
+  await Promise.allSettled(tasks);
 }
 
-function getScheduleMessageForToday(config, tz) {
-  const weekday = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    weekday: "long",
-  })
-    .format(new Date())
-    .toLowerCase();
-  return (config.messages || {})[weekday];
+function parseMetadata(rawValue) {
+  try {
+    return JSON.parse(rawValue || "{}");
+  } catch (_) {
+    return {};
+  }
 }
 
-app.command("/yoga", async ({ command, ack, respond }) => {
+function mapValidationErrorsToSlack(fieldErrors) {
+  const mapping = {
+    name: BLOCK_IDS.name,
+    mode: BLOCK_IDS.mode,
+    timezone: BLOCK_IDS.timezone,
+    weekday: BLOCK_IDS.weekday,
+    time: BLOCK_IDS.time,
+    cron: BLOCK_IDS.cron,
+    message: BLOCK_IDS.message,
+    target: BLOCK_IDS.target,
+  };
+
+  return Object.entries(fieldErrors).reduce((acc, [key, value]) => {
+    if (mapping[key]) acc[mapping[key]] = value;
+    return acc;
+  }, {});
+}
+
+app.command("/yoga", async ({ command, ack, respond, client }) => {
   await ack();
 
-  // 사용 예: /yoga open 19:30 vinyasa
-  const text = (command.text || "").trim();
+  const text = String(command.text || "").trim();
 
   if (text.startsWith("open")) {
-    const detail = text.replace("open", "").trim();
-    const result = await app.client.chat.postMessage({
+    const detail = text.replace(/^open/, "").trim();
+    if (!detail) {
+      await respond({
+        text: "사용법: `/yoga open <시간> <클래스>`",
+        response_type: "ephemeral",
+      });
+      return;
+    }
+
+    const context = createManualAnnouncementContext(detail);
+    await postAnnouncement({
       channel: command.channel_id,
-      text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-      blocks: buildOpenBlocksWithAttendees(detail, []),
+      detail,
+      context,
     });
-    const date = getDateString(SCHEDULE_TZ);
-    setAnnouncement(command.channel_id, date, { ts: result.ts, channel: command.channel_id, detail });
     return;
   }
 
   if (text.startsWith("test")) {
-    const config = loadScheduleConfig();
-    const testChannel = config.testChannelId;
-    if (!testChannel) {
+    if (!TEST_CHANNEL_ID) {
       await respond({
-        text: "`yoga-schedule.json`에 `testChannelId`를 설정해 주세요.",
+        text: "`SLACK_TEST_CHANNEL_ID`를 설정해 주세요.",
         response_type: "ephemeral",
       });
       return;
     }
 
-    const args = text.split(/\s+/);
-    const dayArg = args[1];
-    let day;
-    if (dayArg) {
-      day = dayArg.toLowerCase();
-    } else {
-      const tz = config.timezone || SCHEDULE_TZ;
-      day = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" })
-        .format(new Date())
-        .toLowerCase();
-    }
-
-    const detail = (config.messages || {})[day];
-    if (!detail) {
+    const schedules = scheduleStore.list();
+    if (schedules.length === 0) {
       await respond({
-        text: `\`${day}\`에 설정된 메시지가 없습니다. (monday/tuesday/thursday 중 하나를 입력하세요)`,
+        text: "테스트할 저장된 스케줄이 아직 없어요.",
         response_type: "ephemeral",
       });
       return;
     }
 
-    const result = await app.client.chat.postMessage({
-      channel: testChannel,
-      text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-      blocks: buildOpenBlocksWithAttendees(detail, []),
-    });
-    const date = getDateString(SCHEDULE_TZ);
-    setAnnouncement(testChannel, date, { ts: result.ts, channel: testChannel, detail });
-    await respond({
-      text: `테스트 메시지를 발송했습니다. (${day} / <#${testChannel}>)`,
-      response_type: "ephemeral",
+    await client.views.open({
+      trigger_id: command.trigger_id,
+      view: buildTestPickerModalView({
+        schedules: getDecoratedSchedules(),
+        requestChannelId: command.channel_id,
+      }),
     });
     return;
   }
 
+  if (text.startsWith("schedule")) {
+    if (!isAdminUser(command.user_id, ADMIN_USER_IDS)) {
+      await respond({
+        text: "이 기능은 스케줄 관리자만 사용할 수 있어요.",
+        response_type: "ephemeral",
+      });
+      return;
+    }
+
+    try {
+      await client.views.open({
+        trigger_id: command.trigger_id,
+        view: buildScheduleAdminModalView({
+          schedules: getDecoratedSchedules(),
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to open schedule admin modal:", error);
+      await respond({
+        text: "스케줄 관리 창을 여는 중 오류가 발생했어요.",
+        response_type: "ephemeral",
+      });
+    }
+    return;
+  }
+
   await respond({
-    text: "사용법: `/yoga open <시간> <클래스>` (버튼으로 참여)\n테스트: `/yoga test [monday|tuesday|thursday]`",
+    text:
+      "사용법: `/yoga open <시간> <클래스>`\n" +
+      "테스트: `/yoga test`\n" +
+      "스케줄 관리: `/yoga schedule`",
     response_type: "ephemeral",
   });
 });
 
 app.action("yoga_interest", async ({ ack, body, client }) => {
   await ack();
+
   const channelId = body.channel && body.channel.id;
   const userId = body.user && body.user.id;
-  if (!channelId || !userId) return;
+  const action = body.actions && body.actions[0];
+  const context = action && decodeAnnouncementContext(action.value);
+
+  if (!channelId || !userId || !context) {
+    return;
+  }
 
   await client.chat.postEphemeral({
     channel: channelId,
     user: userId,
-    blocks: buildAttendBlocks(),
+    blocks: buildAttendBlocks(context),
     text: "오늘 참여 형태를 선택해 주세요.",
   });
 });
 
 async function handleAttendanceAction({ ack, body, client, status }) {
   await ack();
+
   const channelId = body.channel && body.channel.id;
   const user = body.user || {};
-  if (!channelId || !user.id) return;
+  const action = body.actions && body.actions[0];
+  const context = action && decodeAnnouncementContext(action.value);
 
-  const date = getDateString(SCHEDULE_TZ);
+  if (!channelId || !user.id || !context) return;
+
   try {
-    await appendAttendance({
-      date,
+    await attendanceService.appendAttendance({
+      occurrenceDate: context.occurrenceDate,
+      scheduleId: context.scheduleId,
+      jobName: context.jobName || "Yoga",
       userId: user.id,
       userName: user.username || user.name || user.id,
       status,
+      timezone: context.timezone || DEFAULT_TIMEZONE,
     });
+
     await client.chat.postEphemeral({
       channel: channelId,
       user: user.id,
-      blocks: buildCancelBlocks(),
+      blocks: buildCancelBlocks(context),
       text: "참석 등록이 완료됐어요.",
     });
-    await updateAnnouncementWithAttendees(client, channelId, date);
-  } catch (err) {
+
+    await updateAnnouncementWithAttendees(client, context);
+  } catch (error) {
     await client.chat.postEphemeral({
       channel: channelId,
       user: user.id,
-      text: `참석 등록에 실패했어요: ${err.message}`,
+      text: `참석 등록에 실패했어요: ${error.message}`,
     });
   }
 }
@@ -560,63 +410,251 @@ app.action("yoga_late", async ({ ack, body, client }) => {
 
 app.action("yoga_cancel", async ({ ack, body, client }) => {
   await ack();
+
   const channelId = body.channel && body.channel.id;
   const user = body.user || {};
-  if (!channelId || !user.id) return;
+  const action = body.actions && body.actions[0];
+  const context = action && decodeAnnouncementContext(action.value);
 
-  const date = getDateString(SCHEDULE_TZ);
+  if (!channelId || !user.id || !context) return;
+
   try {
-    const removed = await deleteAttendance({ date, userId: user.id });
+    const removed = await attendanceService.deleteAttendance({
+      occurrenceDate: context.occurrenceDate,
+      scheduleId: context.scheduleId,
+      userId: user.id,
+    });
+
     await client.chat.postEphemeral({
       channel: channelId,
       user: user.id,
       text: removed ? "취소가 완료됐어요." : "이미 취소되었거나 신청 내역이 없어요.",
     });
-    if (removed) await updateAnnouncementWithAttendees(client, channelId, date);
-  } catch (err) {
+
+    if (removed) {
+      await updateAnnouncementWithAttendees(client, context);
+    }
+  } catch (error) {
     await client.chat.postEphemeral({
       channel: channelId,
       user: user.id,
-      text: `취소에 실패했어요: ${err.message}`,
+      text: `취소에 실패했어요: ${error.message}`,
     });
   }
 });
 
-(async () => {
-  await app.start();
-  console.log("⚡️ Yogamuri bot is running (Socket Mode)");
+app.event("app_home_opened", async ({ event, client }) => {
+  await publishHome(client, event.user);
+});
 
-  if (!SLACK_CHANNEL_ID) {
-    console.warn("⚠️ SLACK_CHANNEL_ID is missing. Scheduled messages will not be sent.");
+app.action(ACTION_IDS.scheduleAdminAddOpen, async ({ ack, body, client }) => {
+  await ack();
+
+  if (!isAdminUser(body.user && body.user.id, ADMIN_USER_IDS)) return;
+
+  const view = buildAddScheduleModalView({
+    defaultTimezone: DEFAULT_TIMEZONE,
+    metadata: {
+      source: body.view && body.view.type,
+      userId: body.user.id,
+      ...(body.view && body.view.type === "modal"
+        ? { rootViewId: body.view.root_view_id || body.view.id }
+        : {}),
+    },
+  });
+
+  if (body.view && body.view.type === "modal") {
+    await client.views.push({
+      trigger_id: body.trigger_id,
+      view,
+    });
     return;
   }
 
-  const scheduleConfig = loadScheduleConfig();
-  const scheduleExpression = scheduleConfig.schedule || "0 9 * * 1,2,4";
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view,
+  });
+});
 
-  cron.schedule(
-    scheduleExpression,
-    async () => {
-      try {
-        const config = loadScheduleConfig();
-        const tz = config.timezone || SCHEDULE_TZ;
-        const channel = config.channelId || SLACK_CHANNEL_ID;
-        const detail = getScheduleMessageForToday(config, tz);
-        if (!detail) {
-          console.warn("⚠️ No scheduled message for today.");
-          return;
-        }
-        const result = await app.client.chat.postMessage({
-          channel,
-          text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-          blocks: buildOpenBlocksWithAttendees(detail, []),
-        });
-        const date = getDateString(tz);
-        setAnnouncement(channel, date, { ts: result.ts, channel, detail });
-      } catch (err) {
-        console.error("Failed to post scheduled yoga message:", err);
-      }
+app.action(ACTION_IDS.scheduleAdminToggle, async ({ ack, body, action, client }) => {
+  await ack();
+
+  if (!isAdminUser(body.user && body.user.id, ADMIN_USER_IDS)) return;
+
+  try {
+    const schedule = scheduleStore.toggle(action.value);
+    scheduleRegistry.syncSchedule(schedule);
+    const rootViewId = body.view && body.view.type === "modal" ? body.view.root_view_id || body.view.id : null;
+    await refreshAdminSurfaces(client, body.user.id, rootViewId);
+  } catch (error) {
+    console.error("Failed to toggle schedule:", error);
+  }
+});
+
+app.action(ACTION_IDS.scheduleAdminDelete, async ({ ack, body, action, client }) => {
+  await ack();
+
+  if (!isAdminUser(body.user && body.user.id, ADMIN_USER_IDS)) return;
+
+  try {
+    const removed = scheduleStore.delete(action.value);
+    scheduleRegistry.unregister(removed.id);
+    const rootViewId = body.view && body.view.type === "modal" ? body.view.root_view_id || body.view.id : null;
+    await refreshAdminSurfaces(client, body.user.id, rootViewId);
+  } catch (error) {
+    console.error("Failed to delete schedule:", error);
+  }
+});
+
+app.action(ACTION_IDS.scheduleModeChanged, async ({ ack, body, action, client }) => {
+  await ack();
+
+  if (!isAdminUser(body.user && body.user.id, ADMIN_USER_IDS)) return;
+  if (!body.view) return;
+
+  const metadata = parseMetadata(body.view.private_metadata);
+  const draft = extractScheduleDraftFromState(body.view.state.values, DEFAULT_TIMEZONE);
+  draft.mode = action.selected_option && action.selected_option.value === "cron" ? "cron" : "weekly";
+
+  if (draft.mode === "cron") {
+    draft.weekday = "monday";
+    draft.time = "";
+  } else {
+    draft.cron = "";
+  }
+
+  try {
+    await client.views.update({
+      view_id: body.view.id,
+      hash: body.view.hash,
+      view: buildAddScheduleModalView({
+        defaultTimezone: DEFAULT_TIMEZONE,
+        metadata,
+        values: draft,
+      }),
+    });
+  } catch (error) {
+    console.error("Failed to switch schedule mode:", error);
+  }
+});
+
+app.view(CALLBACK_IDS.scheduleAdd, async ({ ack, body, view, client }) => {
+  if (!isAdminUser(body.user && body.user.id, ADMIN_USER_IDS)) {
+    await ack({
+      response_action: "errors",
+      errors: {
+        [BLOCK_IDS.name]: "Only schedule admins can save schedules.",
+      },
+    });
+    return;
+  }
+
+  try {
+    const input = extractScheduleFormValues(view, DEFAULT_TIMEZONE);
+    const schedule = scheduleStore.create(input);
+    scheduleRegistry.syncSchedule(schedule);
+    const metadata = parseMetadata(view.private_metadata);
+    await ack();
+    await refreshAdminSurfaces(client, body.user.id, metadata.rootViewId);
+  } catch (error) {
+    if (error.code === "VALIDATION_ERROR") {
+      await ack({
+        response_action: "errors",
+        errors: mapValidationErrorsToSlack(error.fieldErrors),
+      });
+      return;
+    }
+
+    await ack({
+      response_action: "errors",
+      errors: {
+        [BLOCK_IDS.name]: error.message || "Failed to save schedule.",
+      },
+    });
+  }
+});
+
+app.view(CALLBACK_IDS.scheduleTest, async ({ ack, body, view, client }) => {
+  const scheduleId = extractTestScheduleSelection(view);
+  if (!scheduleId) {
+    await ack({
+      response_action: "errors",
+      errors: {
+        [BLOCK_IDS.testSchedule]: "Choose a saved schedule.",
+      },
+    });
+    return;
+  }
+
+  const schedule = scheduleStore.get(scheduleId);
+  if (!schedule) {
+    await ack({
+      response_action: "errors",
+      errors: {
+        [BLOCK_IDS.testSchedule]: "That schedule no longer exists.",
+      },
+    });
+    return;
+  }
+
+  await ack();
+
+  try {
+    await postScheduleToTestChannel(schedule);
+
+    const metadata = parseMetadata(view.private_metadata);
+    if (metadata.requestChannelId) {
+      await client.chat.postEphemeral({
+        channel: metadata.requestChannelId,
+        user: body.user.id,
+        text: `테스트 메시지를 발송했습니다. (${schedule.name} / <#${TEST_CHANNEL_ID}>)`,
+      });
+    }
+  } catch (error) {
+    const metadata = parseMetadata(view.private_metadata);
+    if (metadata.requestChannelId) {
+      await client.chat.postEphemeral({
+        channel: metadata.requestChannelId,
+        user: body.user.id,
+        text: `테스트 메시지 발송에 실패했어요: ${error.message}`,
+      });
+    }
+  }
+});
+
+(async () => {
+  scheduleStore.initialize();
+
+  await app.start();
+  console.log("⚡️ Yogamuri bot is running (Socket Mode)");
+  scheduleRegistry.syncAll(scheduleStore.list());
+  logStartupWarnings({
+    productionChannelId: PRODUCTION_CHANNEL_ID,
+    testChannelId: TEST_CHANNEL_ID,
+    adminPassword: ADMIN_PASSWORD,
+    adminUserIds: ADMIN_USER_IDS,
+    logger: console,
+  });
+
+  const sessionStore = new AdminSessionStore();
+  await startAdminServer({
+    adminPassword: ADMIN_PASSWORD,
+    pageHtml: renderAdminPage({ defaultTimezone: DEFAULT_TIMEZONE }),
+    port: Number.isFinite(ADMIN_UI_PORT) ? ADMIN_UI_PORT : 8400,
+    scheduleStore,
+    sessionStore,
+    serializeSchedule: (schedule) => describeSchedule(schedule, resolveScheduleChannel),
+    onScheduleCreated: async (schedule) => {
+      scheduleRegistry.syncSchedule(schedule);
     },
-    { timezone: SCHEDULE_TZ }
-  );
+    onScheduleDeleted: async (schedule) => {
+      scheduleRegistry.unregister(schedule.id);
+    },
+    onScheduleToggled: async (schedule) => {
+      scheduleRegistry.syncSchedule(schedule);
+    },
+  });
+
+  console.log(`🌿 Admin page available on port ${ADMIN_UI_PORT || 8400}`);
 })();

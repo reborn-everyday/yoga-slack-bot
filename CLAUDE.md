@@ -5,57 +5,56 @@ Slack bot that automates yoga class announcements and attendance tracking for a 
 ## Tech Stack
 
 - **Runtime**: Node.js 20 (CommonJS)
-- **Slack**: `@slack/bolt` in Socket Mode (no public HTTP endpoint needed)
+- **Slack**: `@slack/bolt` in Socket Mode with slash commands, App Home, modals, and interactive buttons
+- **Admin UI**: built-in Node HTTP server serving a plain HTML/CSS/JS schedule page
 - **Google Sheets**: `googleapis` with service account auth for attendance storage
-- **Scheduling**: `node-cron` for automatic daily announcements
-- **Config**: `dotenv` for secrets, `yoga-schedule.json` for class timetable
+- **Scheduling**: `node-cron` with persisted schedule rows and per-row timezone/target
+- **Persistence**: `./config/schedules.seed.json` for git-tracked default schedules and `/app/data/*.json` for live runtime state in Docker
+- **Config**: `dotenv` for secrets and runtime configuration
 
 ## Project Structure
 
 ```
-index.js              — Entire bot logic (single-file application)
-yoga-schedule.json    — Weekly class schedule config (days, times, locations, channels)
+index.js              — Main runtime wiring for Slack, cron, Sheets, and admin HTTP server
+src/                  — Schedule store, admin routes, Slack views, attendance helpers, registry
+test/                 — Node test runner coverage for store, routes, registry, and Slack UI helpers
 package.json          — Dependencies and scripts
 .env.example          — Required environment variables template
 Dockerfile            — Production container (node:20-slim, non-root)
-docker-compose.yml    — Single-service compose with auto-restart
+docker-compose.yml    — Single-service compose with localhost-only admin port binding and a named Docker volume for runtime state
 docs/                 — Deployment documentation
 ```
 
-## Key Sections in index.js
+## Core Modules
 
-| Section                  | Lines   | Purpose                                                        |
-|--------------------------|---------|----------------------------------------------------------------|
-| Slack App init           | 8-12    | `@slack/bolt` app in Socket Mode                               |
-| Config & env             | 14-18   | Reads timezone, channel, Sheets ID, schedule path from env     |
-| Google Auth              | 20-38   | Loads service account creds (JSON, base64, or file)            |
-| Date/time helpers        | 40-71   | Formatting for sheet operations                                |
-| Header mapping           | 73-98   | Maps sheet columns by English/Korean aliases for flexibility   |
-| Sheets client            | 100-107 | Authenticated Google Sheets API client                         |
-| Append attendance        | 109-172 | Upserts attendance row by date + userId                        |
-| Delete attendance        | 174-230 | Removes attendance row on cancel                               |
-| Slack Block builders     | 232-321 | Block Kit UI (interest, attend, late, cancel buttons)          |
-| Schedule config loader   | 323-336 | Reads yoga-schedule.json, picks today's message                |
-| `/yoga` slash command    | 338-402 | `open` (post announcement) and `test` (test channel) commands  |
-| Button action handlers   | 404-476 | Handles interest, attend, late, cancel button interactions     |
-| Cron scheduler           | 478-513 | Auto-posts announcements at configured cron time               |
+| Module                    | Purpose                                                                      |
+|---------------------------|------------------------------------------------------------------------------|
+| `src/schedule-store.js`   | Persists schedules, validates weekly-vs-cron XOR input, sorts enabled first   |
+| `src/schedule-registry.js`| Registers enabled cron jobs and re-syncs them on create/toggle               |
+| `src/admin-server.js`     | Serves `/admin` and authenticated JSON APIs for create/list/toggle           |
+| `src/slack-admin.js`      | Builds App Home, admin modal, weekly-or-cron add modal, and test picker views |
+| `src/attendance-service.js` | Reads/writes Google Sheets and auto-adds `scheduleId` / `jobName` columns |
+| `src/announcement-store.js` | Tracks live announcement messages by `scheduleId + occurrenceDate`         |
 
 ## User Flow
 
 ```
-Cron (9AM Mon/Tue/Thu)  ──or──  /yoga open command
-        │                              │
-        ▼                              ▼
-  Post class announcement to Slack channel
+Admin page / Slack modal / App Home
         │
         ▼
-  User clicks "저요!" (I'm in!)
+  Create or toggle saved schedule rows
         │
         ▼
-  Ephemeral: "참석" (Attend) or "늦참" (Late)
+  `node-cron` registry updates immediately
         │
         ▼
-  Record written to Google Sheet  ←──  "취소" (Cancel) deletes it
+  Scheduled or manual announcement posts to Slack
+        │
+        ▼
+  Users register attendance via buttons
+        │
+        ▼
+  Attendance is stored in Google Sheets with `scheduleId + date + userId`
 ```
 
 ## Commands
@@ -71,13 +70,19 @@ npm start          — Run in production mode
 | Command                       | Description                                          |
 |-------------------------------|------------------------------------------------------|
 | `/yoga open <time> <class>`   | Post class announcement to channel immediately       |
-| `/yoga test [day]`            | Send test message to test channel (defaults to today) |
+| `/yoga test`                  | Pick a saved schedule and send it to the test channel |
+| `/yoga schedule`              | Open the schedule admin modal (allowlisted users)     |
 
 ## Environment Variables
 
 See `.env.example` for the full list. Key variables:
 - `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` — Slack credentials
-- `SLACK_CHANNEL_ID` — Target channel for announcements
+- `SLACK_CHANNEL_ID` / `SLACK_TEST_CHANNEL_ID` — Production and test announcement channels
+- `ADMIN_PASSWORD` — Password for `/admin`
+- `ADMIN_UI_PORT` — Port for the built-in admin page
+- `SCHEDULE_ADMIN_USER_IDS` — Comma-separated Slack admin allowlist
+- `SCHEDULE_STORE_PATH` — Persisted runtime schedule JSON file
+- `SCHEDULE_SEED_PATH` — Git-tracked default schedule seed file
 - `GOOGLE_SHEETS_ID` — Spreadsheet for attendance records
 - `GOOGLE_SERVICE_ACCOUNT_KEY` or `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` — Google auth
 - `SCHEDULE_TZ` — Timezone (default: `Asia/Seoul`)

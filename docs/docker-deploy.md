@@ -1,6 +1,6 @@
 # Docker 운영 가이드
 
-이 프로젝트는 Slack Socket Mode 기반이라 외부 HTTP 포트 오픈 없이 컨테이너로 상시 실행할 수 있습니다.
+이 프로젝트는 Slack Socket Mode 기반으로 동작하고, 같은 컨테이너 안에서 작은 관리자 웹 페이지도 함께 제공합니다.
 
 ## 1) 사전 준비
 
@@ -11,6 +11,9 @@
 - `SLACK_BOT_TOKEN`
 - `SLACK_APP_TOKEN`
 - `SLACK_CHANNEL_ID`
+- `SLACK_TEST_CHANNEL_ID`
+- `ADMIN_PASSWORD`
+- `SCHEDULE_ADMIN_USER_IDS`
 - `GOOGLE_SHEETS_ID`
 - `GOOGLE_SERVICE_ACCOUNT_KEY` 또는 `GOOGLE_SERVICE_ACCOUNT_KEY_FILE`
 
@@ -33,6 +36,9 @@ docker compose ps
 docker compose logs -f yoga-slack-bot
 ```
 
+관리자 페이지는 기본적으로 호스트의 `127.0.0.1:${ADMIN_UI_PORT:-8400}` 으로만 바인딩됩니다.
+필요하면 SSH 터널이나 별도 reverse proxy 뒤에서 접근하세요.
+
 ## 4) 업데이트 배포
 
 ```bash
@@ -41,11 +47,17 @@ docker compose up -d --build
 docker compose logs -f yoga-slack-bot
 ```
 
+주의:
+- 스케줄 변경은 Docker volume 안의 런타임 데이터에 저장됩니다.
+- `config/schedules.seed.json` 은 빈 volume 을 처음 만들 때만 사용됩니다.
+- 이미 실행 중인 환경에 다시 배포해도 기존 volume 이 있으면 관리자 UI에서 바꾼 스케줄이 유지됩니다.
+
 ## 5) 운영 점검
 
 - 상태: `docker compose ps`
 - 로그: `docker compose logs --tail=200 yoga-slack-bot`
 - 재시작: `docker compose restart yoga-slack-bot`
+- 관리자 페이지: `http://127.0.0.1:${ADMIN_UI_PORT:-8400}/admin`
 
 ## 6) 중지
 
@@ -53,26 +65,49 @@ docker compose logs -f yoga-slack-bot
 docker compose down
 ```
 
-## 7) 스케줄 설정 (yoga-schedule.json)
+## 7) 스케줄 설정
 
-스케줄 및 메시지는 `yoga-schedule.json`에서 관리합니다. **재빌드 없이** 즉시 반영됩니다 (cron 실행 시마다 파일을 재로드).
+스케줄과 메시지는 이제 내장 관리자 UI에서 관리합니다. 등록/토글은 **재시작 없이** 즉시 반영됩니다.
+
+- 웹 UI: `/admin`
+- Slack UI: `/yoga schedule` 또는 App Home
+- seed 파일: 로컬 `./config/schedules.seed.json`
+- 런타임 파일: 컨테이너 `/app/data/schedules.json`
+- `config/schedules.seed.json` 을 수정하면 새 volume 을 만들 때의 초기값을 바꿀 수 있습니다.
+- 관리자 UI/Slack UI 에서 저장한 변경은 runtime store 만 바꾸며 seed 파일은 자동 반영되지 않습니다.
+- `/app/data/active-announcements.json` 은 이미 발송된 공지 메시지 추적용 런타임 파일입니다.
 
 | 필드 | 설명 |
 |------|------|
-| `channelId` | 프로덕션 채널 ID (자동 발송 대상) |
-| `testChannelId` | 테스트 채널 ID (`/yoga test` 수동 발송 대상) |
-| `schedule` | cron 표현식 (기본: `0 9 * * 1,2,4` → 매주 월/화/목 오전 9시) |
-| `messages` | 요일별 메시지 내용 (`monday`, `tuesday`, `thursday` 키 사용) |
+| `name` | 스케줄 이름 |
+| `timezone` | `Asia/Seoul` 또는 `UTC` |
+| `cron` | 저장되는 최종 cron 표현식 |
+| `message` | 발송할 Slack 메시지 |
+| `target` | `production` 또는 `test` |
+| `enabled` | on/off 상태 |
+
+입력 방식:
+
+- `Weekly`: 요일 + 시간 입력 후 내부적으로 cron 으로 변환
+- `Cron`: 테스트용 자유 입력 cron
+- 두 방식은 동시에 입력할 수 없고, 하나만 유효합니다.
 
 ## 8) 테스트 메시지 발송
 
-슬랙 커맨드로 테스트 채널에 즉시 메시지를 보낼 수 있습니다:
+슬랙 커맨드 `/yoga test` 로 저장된 스케줄 하나를 골라 테스트 채널에 즉시 메시지를 보낼 수 있습니다.
 
 | 커맨드 | 동작 |
 |--------|------|
-| `/yoga test` | 오늘 요일 메시지를 테스트 채널로 발송 |
-| `/yoga test monday` | 월요일 메시지 발송 |
-| `/yoga test tuesday` | 화요일 메시지 발송 |
-| `/yoga test thursday` | 목요일 메시지 발송 |
+| `/yoga test` | 저장된 스케줄 선택 후 테스트 채널에 발송 |
+| `/yoga schedule` | 스케줄 목록, 등록, on/off 토글 |
 
-`yoga-schedule.json`의 `testChannelId`가 설정되어 있어야 동작합니다.
+`SLACK_TEST_CHANNEL_ID` 가 설정되어 있어야 동작합니다.
+
+## 9) seed 로 다시 초기화
+
+현재 volume 을 버리고 `config/schedules.seed.json` 기준으로 다시 시작하려면:
+
+```bash
+docker compose down -v
+docker compose up -d --build
+```

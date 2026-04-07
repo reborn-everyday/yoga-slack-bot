@@ -1,0 +1,35 @@
+[
+  {
+    "id": "9f56590e-2db0-4d52-a737-3fd0f227f83f",
+    "name": "Monday Ashtanga",
+    "timezone": "Asia/Seoul",
+    "cron": "0 9 * * 1",
+    "message": "아쉬탕가 @ 11:30, 4층 Idea Hub",
+    "target": "production",
+    "enabled": true,
+    "createdAt": "2026-04-07T03:10:00.000Z",
+    "updatedAt": "2026-04-07T03:10:00.000Z"
+  },
+  {
+    "id": "6904c635-f495-4da4-96bf-0bc440e785d2",
+    "name": "Tuesday Hatha",
+    "timezone": "Asia/Seoul",
+    "cron": "0 9 * * 2",
+    "message": "하타 @ 11:30, 4층 Idea Hub",
+    "target": "production",
+    "enabled": true,
+    "createdAt": "2026-04-07T03:10:00.000Z",
+    "updatedAt": "2026-04-07T03:10:00.000Z"
+  },
+  {
+    "id": "0c451802-095b-4316-b081-0e6dcf04e4f0",
+    "name": "Thursday Healing",
+    "timezone": "Asia/Seoul",
+    "cron": "0 9 * * 4",
+    "message": "힐링 @ 11:30, 4층 Idea Hub",
+    "target": "production",
+    "enabled": true,
+    "createdAt": "2026-04-07T03:10:00.000Z",
+    "updatedAt": "2026-04-07T03:10:00.000Z"
+  }
+]

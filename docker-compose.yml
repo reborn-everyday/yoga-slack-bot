@@ -4,14 +4,20 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: yoga-slack-bot
+    user: "0:0"
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      - "127.0.0.1:${ADMIN_UI_PORT:-8400}:${ADMIN_UI_PORT:-8400}"
     volumes:
-      - announcements-data:/app/data
+      - yoga-slack-bot-data:/app/data
     environment:
       NODE_ENV: production
-      SCHEDULE_CONFIG_PATH: /app/yoga-schedule.json
+      ADMIN_UI_PORT: ${ADMIN_UI_PORT:-8400}
+      ANNOUNCEMENTS_FILE: /app/data/active-announcements.json
+      SCHEDULE_STORE_PATH: /app/data/schedules.json
+      SCHEDULE_SEED_PATH: /app/config/schedules.seed.json
 
 volumes:
-  announcements-data:
+  yoga-slack-bot-data:
