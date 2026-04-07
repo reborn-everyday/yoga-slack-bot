@@ -7,6 +7,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - announcements-data:/app/data
     environment:
       NODE_ENV: production
       SCHEDULE_CONFIG_PATH: /app/yoga-schedule.json
+
+volumes:
+  announcements-data:
