@@ -29,13 +29,23 @@ class AnnouncementStore {
   }
 
   set(announcement) {
-    const key = this.makeKey(announcement.scheduleId, announcement.occurrenceDate);
+    const key = announcement.occurrenceId || this.makeKey(announcement.scheduleId, announcement.occurrenceDate);
     this.announcements.set(key, announcement);
     this.save();
   }
 
   get(scheduleId, occurrenceDate) {
     return this.announcements.get(this.makeKey(scheduleId, occurrenceDate)) || null;
+  }
+
+  find(context) {
+    return [...this.announcements.values()].filter((item) =>
+      item.scheduleId === context.scheduleId &&
+      item.occurrenceDate === context.occurrenceDate &&
+      (item.type || "class") === (context.type || "class") &&
+      (item.target || (item.scheduleId.startsWith("test:") ? "test" : "production")) ===
+        (context.target || (context.scheduleId.startsWith("test:") ? "test" : "production"))
+    );
   }
 }
 

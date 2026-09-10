@@ -8,10 +8,10 @@ const {
   buildAddScheduleModalView,
   buildAdminHomeView,
   buildScheduleAdminModalView,
-  buildTestPickerModalView,
+  buildSendModalView,
   extractScheduleDraftFromState,
   extractScheduleFormValues,
-  extractTestScheduleSelection,
+  extractSendSelection,
   getDefaultDraft,
   isAdminUser,
   parseAdminUserIds,
@@ -67,7 +67,7 @@ test("Slack admin helpers enforce allowlist and render home/modal views", () => 
   assert.equal(actionsBlock.elements[1].action_id, ACTION_IDS.scheduleAdminDelete);
 });
 
-test("Slack add/test modals round-trip schedule form values", () => {
+test("Slack add/send modals round-trip schedule form values", () => {
   const addModal = buildAddScheduleModalView({
     defaultTimezone: "Asia/Seoul",
     metadata: { source: "modal", rootViewId: "VROOT1", userId: "U1" },
@@ -101,10 +101,11 @@ test("Slack add/test modals round-trip schedule form values", () => {
   });
 
   assert.deepEqual(weeklyFormValues, {
+    type: "class",
     name: "Lunch Yoga Monday",
     mode: "weekly",
     timezone: "Asia/Seoul",
-    weekday: "monday",
+    weekdays: ["monday"],
     time: "09:00",
     cron: "",
     message: "Monday lunch class",
@@ -137,35 +138,81 @@ test("Slack add/test modals round-trip schedule form values", () => {
     "Asia/Seoul"
   );
   assert.deepEqual(cronDraft, {
+    type: "class",
     name: "Cron Test",
     mode: "cron",
     timezone: "UTC",
-    weekday: "",
+    weekdays: [],
     time: "",
     cron: "*/15 * * * *",
     message: "Cron flow",
     target: "test",
   });
 
-  const testModal = buildTestPickerModalView({
+  const testModal = buildSendModalView({
     schedules: [sampleSchedule],
     requestChannelId: "C123",
   });
-  assert.equal(testModal.callback_id, CALLBACK_IDS.scheduleTest);
+  assert.equal(testModal.callback_id, CALLBACK_IDS.scheduleSend);
   assert.equal(testModal.blocks[0].element.options[0].value, "schedule-1");
-  assert.match(testModal.blocks[0].element.options[0].text.text, /^name: Lunch Yoga Monday \| status: on$/);
+  assert.match(testModal.blocks[0].element.options[0].text.text, /^수업 · Lunch Yoga Monday$/);
 
-  const selectedScheduleId = extractTestScheduleSelection({
+  const selectedScheduleId = extractSendSelection({
     state: {
       values: {
-        test_schedule: {
+        schedule_target: { value: { selected_option: { value: "production" } } },
+        send_schedule: {
           value: { selected_option: { value: "schedule-1" } },
         },
       },
     },
   });
 
-  assert.equal(selectedScheduleId, "schedule-1");
+  assert.deepEqual(selectedScheduleId, { scheduleId: "schedule-1", target: "production" });
+});
+
+test("weekly modal round-trips multiple checkbox days and typed minutes", () => {
+  const draft = extractScheduleDraftFromState({
+    [BLOCK_IDS.type]: { value: { selected_option: { value: "habit" } } },
+    [BLOCK_IDS.weekday]: { value: { selected_options: ["friday", "monday", "wednesday"].map((value) => ({ value })) } },
+    [BLOCK_IDS.time]: { value: { value: "18:07" } },
+  });
+  assert.deepEqual(draft.weekdays, ["monday", "wednesday", "friday"]);
+  assert.equal(draft.time, "18:07");
+  const modal = buildAddScheduleModalView({ values: draft });
+  const days = modal.blocks.find((block) => block.block_id === BLOCK_IDS.weekday).element;
+  assert.equal(days.type, "checkboxes");
+  assert.equal(days.options.length, 7);
+  assert.deepEqual(days.initial_options.map((option) => option.value), draft.weekdays);
+  const time = modal.blocks.find((block) => block.block_id === BLOCK_IDS.time).element;
+  assert.equal(time.type, "plain_text_input");
+  assert.equal(time.initial_value, "18:07");
+  const empty = extractScheduleDraftFromState({
+    [BLOCK_IDS.weekday]: { value: { selected_options: [] } },
+    [BLOCK_IDS.time]: { value: { value: "" } },
+  });
+  assert.deepEqual(empty.weekdays, []);
+  assert.equal(empty.time, "");
+  assert.equal(buildAddScheduleModalView({ values: empty }).blocks
+    .find((block) => block.block_id === BLOCK_IDS.weekday).element.initial_options, undefined);
+});
+
+test("habit and report types survive form mode changes and use the same send picker", () => {
+  for (const type of ["habit", "report"]) {
+    const draft = extractScheduleDraftFromState({
+      [BLOCK_IDS.type]: { value: { selected_option: { value: type } } },
+      [BLOCK_IDS.mode]: { [ACTION_IDS.scheduleModeChanged]: { selected_option: { value: "cron" } } },
+      [BLOCK_IDS.cron]: { value: { value: "0 12 * * *" } },
+      [BLOCK_IDS.message]: { value: { value: type === "report" ? null : "걷기" } },
+    });
+    const modal = buildAddScheduleModalView({ values: draft });
+    assert.equal(modal.blocks.find((block) => block.block_id === BLOCK_IDS.type).element.initial_option.value, type);
+    assert.equal(modal.blocks.find((block) => block.block_id === BLOCK_IDS.cron).element.initial_value, "0 12 * * *");
+    assert.equal(modal.blocks.some((block) => block.block_id === BLOCK_IDS.weekday), false);
+    assert.equal(modal.blocks.find((block) => block.block_id === BLOCK_IDS.message).optional, true);
+  }
+  const send = buildSendModalView({ schedules: ["class", "habit", "report"].map((type) => ({ ...sampleSchedule, type, id: type })) });
+  assert.deepEqual(send.blocks[0].element.options.map((option) => option.value), ["class", "habit", "report"]);
 });
 
 test("Announcement blocks preserve the context used by /yoga open and attendance actions", () => {

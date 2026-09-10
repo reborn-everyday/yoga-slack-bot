@@ -17,6 +17,8 @@ const HEADER_LABELS = {
 };
 
 const HEADER_KEYS = Object.keys(HEADER_LABELS);
+const HABIT_SHEET = "HabitParticipation";
+const HABIT_HEADERS = ["date", "scheduleId", "jobName", "userId", "userName", "status", "timestamp", "target", "occurrenceId", "createdAt"];
 
 function extendHeaderRow(headerRow) {
   const nextHeader = [...headerRow];
@@ -240,6 +242,73 @@ class AttendanceService {
     }
 
     return attendees;
+  }
+
+  // The existing Attendance tab remains unchanged. Habit records use an explicit
+  // environment and retain cancelled rows so historical activity is not deleted.
+  async loadHabitData() {
+    const sheets = await this.getSheetsClient();
+    if (!this.habitSheetReady) {
+      this.habitSheetReady = (async () => {
+        const metadata = await sheets.spreadsheets.get({
+          spreadsheetId: this.spreadsheetId,
+          fields: "sheets.properties.title",
+        });
+        if (!(metadata.data.sheets || []).some((sheet) => sheet.properties.title === HABIT_SHEET)) {
+          await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: this.spreadsheetId,
+            requestBody: { requests: [{ addSheet: { properties: { title: HABIT_SHEET } } }] },
+          });
+        }
+        const header = await sheets.spreadsheets.values.get({
+          spreadsheetId: this.spreadsheetId, range: `${HABIT_SHEET}!A1:J1`,
+        });
+        if (!header.data.values?.[0]?.length) {
+          await sheets.spreadsheets.values.update({
+            spreadsheetId: this.spreadsheetId, range: `${HABIT_SHEET}!A1:J1`,
+            valueInputOption: "RAW", requestBody: { values: [HABIT_HEADERS] },
+          });
+        } else if (HABIT_HEADERS.some((name, index) => header.data.values[0][index] !== name)) {
+          throw new Error("HabitParticipation 시트의 열 구성을 확인해 주세요.");
+        }
+      })().catch((error) => { this.habitSheetReady = null; throw error; });
+    }
+    await this.habitSheetReady;
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: this.spreadsheetId, range: `${HABIT_SHEET}!A2:J`,
+    });
+    const records = (result.data.values || []).map((row, index) => ({
+      ...Object.fromEntries(HABIT_HEADERS.map((name, column) => [name, row[column] || ""])),
+      rowNumber: index + 2,
+    }));
+    return { sheets, records };
+  }
+
+  async getHabitRecords() {
+    return (await this.loadHabitData()).records;
+  }
+
+  async toggleHabit(context, user, now = new Date()) {
+    const { sheets, records } = await this.loadHabitData();
+    const existing = records.find((row) => row.target === context.target &&
+      row.scheduleId === context.scheduleId && row.date === context.occurrenceDate && row.userId === user.id);
+    const status = existing?.status === "done" ? "cancelled" : "done";
+    const record = {
+      date: context.occurrenceDate, scheduleId: context.scheduleId, jobName: context.jobName,
+      userId: user.id, userName: user.username || user.name || user.id,
+      status, timestamp: now.toISOString(), target: context.target,
+      occurrenceId: context.occurrenceId, createdAt: existing?.createdAt || now.toISOString(),
+    };
+    const options = {
+      spreadsheetId: this.spreadsheetId, valueInputOption: "RAW",
+      requestBody: { values: [HABIT_HEADERS.map((key) => record[key] || "")] },
+    };
+    if (existing) {
+      await sheets.spreadsheets.values.update({ ...options, range: `${HABIT_SHEET}!A${existing.rowNumber}:J${existing.rowNumber}` });
+    } else {
+      await sheets.spreadsheets.values.append({ ...options, range: `${HABIT_SHEET}!A:J`, insertDataOption: "INSERT_ROWS" });
+    }
+    return status;
   }
 }
 

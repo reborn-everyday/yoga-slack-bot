@@ -1,3 +1,5 @@
+const { SCHEDULE_TYPES } = require("./schedule-store");
+
 function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -63,6 +65,12 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
         font-size: clamp(2rem, 3vw, 3rem);
         line-height: 1;
       }
+
+      .weekday-field { border: 0; padding: 0; margin: 0; min-width: 0; }
+      .weekday-field legend { margin-bottom: 8px; }
+      .weekday-choices { display: flex; flex-wrap: wrap; gap: 14px; }
+      .weekday-choices label { display: inline-flex; align-items: center; gap: 6px; }
+      .weekday-choices input[type="checkbox"] { width: auto; margin: 0; padding: 0; }
 
       .subtle {
         margin: 8px 0 0;
@@ -384,13 +392,16 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
       const logoutButton = document.getElementById("logoutButton");
       const draftPanel = document.getElementById("draftPanel");
 
+      const SCHEDULE_TYPES = ${JSON.stringify(SCHEDULE_TYPES)};
+
       function getDefaultDraft() {
         return {
+          type: "class",
           mode: "weekly",
           name: "",
           timezone: DEFAULT_TIMEZONE,
-          weekday: "monday",
-          time: "",
+          weekdays: ["monday"],
+          time: "09:00",
           cron: "",
           message: "",
           target: "production",
@@ -419,10 +430,11 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
 
       function buildPayloadFromDraft(draft) {
         return {
+          type: draft.type,
           mode: draft.mode,
           name: draft.name,
           timezone: draft.timezone,
-          weekday: draft.mode === "weekly" ? draft.weekday : "",
+          weekdays: draft.mode === "weekly" ? draft.weekdays : [],
           time: draft.mode === "weekly" ? draft.time : "",
           cron: draft.mode === "cron" ? draft.cron : "",
           message: draft.message,
@@ -497,14 +509,14 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
 
         for (const schedule of state.schedules) {
           const row = document.createElement("tr");
-          row.appendChild(createCell("Job name", schedule.name));
+          row.appendChild(createCell("Job name", (SCHEDULE_TYPES[schedule.type || "class"]) + " · " + schedule.name));
 
           const scheduleNode = document.createElement("div");
           const scheduleMain = document.createElement("div");
           scheduleMain.className = "schedule-main";
           scheduleMain.textContent =
-            schedule.scheduleMode === "weekly" && schedule.weekday && schedule.time
-              ? formatWeekday(schedule.weekday) + " " + schedule.time
+            schedule.scheduleMode === "weekly" && schedule.weekdays.length && schedule.time
+              ? schedule.weekdays.map(formatWeekday).join(", ") + " " + schedule.time
               : "Cron: " + schedule.cron;
           const scheduleMeta = document.createElement("span");
           scheduleMeta.className = "schedule-meta";
@@ -594,12 +606,21 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
         nameField.textContent = "Job name";
         const nameInput = document.createElement("input");
         nameInput.value = state.draft.name;
+        nameInput.maxLength = 100;
         nameInput.placeholder = "Lunch Yoga Monday";
         nameInput.addEventListener("input", (event) => {
           state.draft.name = event.target.value;
         });
         nameField.appendChild(nameInput);
         grid.appendChild(nameField);
+
+        const typeField = document.createElement("label");
+        typeField.textContent = "일정 유형";
+        typeField.appendChild(buildSelect(
+          Object.entries(SCHEDULE_TYPES).map(([value, label]) => ({ value, label })),
+          state.draft.type, (event) => { state.draft.type = event.target.value; renderDraft(); }
+        ));
+        grid.appendChild(typeField);
 
         const modeField = document.createElement("label");
         modeField.textContent = "Input mode";
@@ -628,26 +649,45 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
         grid.appendChild(timezoneField);
 
         if (state.draft.mode === "weekly") {
-          const weekdayField = document.createElement("label");
-          weekdayField.textContent = "Day of the week";
-          weekdayField.appendChild(
-            buildSelect(WEEKDAY_OPTIONS, state.draft.weekday, (event) => {
-              state.draft.weekday = event.target.value;
-            })
-          );
+          const weekdayField = document.createElement("fieldset");
+          weekdayField.className = "weekday-field full";
+          const weekdayLegend = document.createElement("legend");
+          weekdayLegend.textContent = "요일 (여러 개 선택 가능)";
+          weekdayField.appendChild(weekdayLegend);
+          const weekdayChoices = document.createElement("div");
+          weekdayChoices.className = "weekday-choices";
+          for (const option of WEEKDAY_OPTIONS) {
+            const choice = document.createElement("label");
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.value = option.value;
+            checkbox.checked = state.draft.weekdays.includes(option.value);
+            checkbox.addEventListener("change", () => {
+              const selected = new Set(state.draft.weekdays);
+              if (checkbox.checked) selected.add(option.value);
+              else selected.delete(option.value);
+              state.draft.weekdays = WEEKDAY_OPTIONS.filter((day) => selected.has(day.value)).map((day) => day.value);
+            });
+            choice.append(checkbox, document.createTextNode(option.label));
+            weekdayChoices.appendChild(choice);
+          }
+          weekdayField.appendChild(weekdayChoices);
           grid.appendChild(weekdayField);
 
           const timeField = document.createElement("label");
-          timeField.textContent = "Time";
+          timeField.textContent = "시간 (HH:mm)";
           const timeInput = document.createElement("input");
-          timeInput.type = "time";
+          timeInput.type = "text";
+          timeInput.placeholder = "09:35";
+          timeInput.maxLength = 5;
+          timeInput.autocomplete = "off";
           timeInput.value = state.draft.time;
           timeInput.addEventListener("input", (event) => {
             state.draft.time = event.target.value;
           });
           const timeNote = document.createElement("div");
           timeNote.className = "field-note";
-          timeNote.textContent = "Use the weekly picker for normal schedules.";
+          timeNote.textContent = "24시간 형식으로 분까지 입력해 주세요. 예: 09:35, 18:07";
           timeField.append(timeInput, timeNote);
           grid.appendChild(timeField);
         } else {
@@ -662,7 +702,7 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
           });
           const cronNote = document.createElement("div");
           cronNote.className = "field-note";
-          cronNote.textContent = "Raw cron is available for testing.";
+          cronNote.textContent = "Use cron for daily or other recurring schedules.";
           cronField.append(cronInput, cronNote);
           grid.appendChild(cronField);
         }
@@ -672,7 +712,8 @@ function renderAdminPage({ defaultTimezone = "Asia/Seoul" } = {}) {
         messageField.textContent = "Message";
         const messageInput = document.createElement("textarea");
         messageInput.value = state.draft.message;
-        messageInput.placeholder = "아쉬탕가 @ 11:30, 4층 Idea Hub";
+        messageInput.maxLength = 2500;
+        messageInput.placeholder = state.draft.type === "report" ? "선택 입력: 순위는 발송 시 자동 집계됩니다." : "발송할 안내 문구를 입력해 주세요.";
         messageInput.addEventListener("input", (event) => {
           state.draft.message = event.target.value;
         });

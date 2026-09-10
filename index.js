@@ -9,7 +9,6 @@ const { AnnouncementStore } = require("./src/announcement-store");
 const {
   buildAttendBlocks,
   buildCancelBlocks,
-  buildOpenBlocksWithAttendees,
   decodeAnnouncementContext,
 } = require("./src/announcement-ui");
 const { renderAdminPage } = require("./src/admin-page");
@@ -25,14 +24,14 @@ const {
   buildAddScheduleModalView,
   buildAdminHomeView,
   buildScheduleAdminModalView,
-  buildTestPickerModalView,
+  buildSendModalView,
   extractScheduleDraftFromState,
   extractScheduleFormValues,
-  extractTestScheduleSelection,
+  extractSendSelection,
   isAdminUser,
   parseAdminUserIds,
 } = require("./src/slack-admin");
-const { getDateString } = require("./src/utils");
+const { AnnouncementService } = require("./src/announcement-service");
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -68,10 +67,15 @@ const attendanceService = new AttendanceService({
   credentialsLoader: getServiceAccountCredentials,
 });
 
+const announcementService = new AnnouncementService({
+  client: app.client, store: announcementStore, attendance: attendanceService,
+  resolveChannel: resolveScheduleChannel,
+});
+
 const scheduleRegistry = new ScheduleRegistry({
   cronLib: cron,
   onTrigger: async (schedule) => {
-    await postSavedSchedule(schedule);
+    await announcementService.send(schedule);
   },
 });
 
@@ -102,98 +106,6 @@ function resolveScheduleChannel(target) {
 
 function getDecoratedSchedules() {
   return scheduleStore.list().map((schedule) => describeSchedule(schedule, resolveScheduleChannel));
-}
-
-function createManualAnnouncementContext(detail) {
-  return {
-    scheduleId: `manual:${crypto.randomUUID()}`,
-    occurrenceDate: getDateString(DEFAULT_TIMEZONE),
-    jobName: detail || "Manual yoga open",
-    timezone: DEFAULT_TIMEZONE,
-  };
-}
-
-function createSavedScheduleContext(schedule) {
-  return {
-    scheduleId: schedule.id,
-    occurrenceDate: getDateString(schedule.timezone),
-    jobName: schedule.name,
-    timezone: schedule.timezone,
-  };
-}
-
-function createTestScheduleContext(schedule) {
-  return {
-    scheduleId: `test:${schedule.id}`,
-    occurrenceDate: getDateString(schedule.timezone),
-    jobName: `${schedule.name} [test]`,
-    timezone: schedule.timezone,
-  };
-}
-
-async function postAnnouncement({ channel, detail, context }) {
-  const result = await app.client.chat.postMessage({
-    channel,
-    text: `🧘 *[요가무리 클래스 오픈]*\n>${detail}`,
-    blocks: buildOpenBlocksWithAttendees(detail, [], context),
-  });
-
-  announcementStore.set({
-    ...context,
-    channel,
-    detail,
-    ts: result.ts,
-  });
-
-  return result;
-}
-
-async function postSavedSchedule(schedule) {
-  const channel = resolveScheduleChannel(schedule.target);
-  if (!channel) {
-    console.warn(`⚠️ Missing Slack channel for target "${schedule.target}" on schedule ${schedule.id}.`);
-    return null;
-  }
-
-  return postAnnouncement({
-    channel,
-    detail: schedule.message,
-    context: createSavedScheduleContext(schedule),
-  });
-}
-
-async function postScheduleToTestChannel(schedule) {
-  if (!TEST_CHANNEL_ID) {
-    throw new Error("Missing SLACK_TEST_CHANNEL_ID.");
-  }
-
-  return postAnnouncement({
-    channel: TEST_CHANNEL_ID,
-    detail: schedule.message,
-    context: createTestScheduleContext(schedule),
-  });
-}
-
-async function updateAnnouncementWithAttendees(client, context) {
-  const announcement = announcementStore.get(context.scheduleId, context.occurrenceDate);
-  if (!announcement) return;
-
-  const attendees = await attendanceService.getAttendees({
-    occurrenceDate: context.occurrenceDate,
-    scheduleId: context.scheduleId,
-  });
-
-  await client.chat.update({
-    channel: announcement.channel,
-    ts: announcement.ts,
-    text: `🧘 *[요가무리 클래스 오픈]*\n>${announcement.detail}`,
-    blocks: buildOpenBlocksWithAttendees(announcement.detail, attendees, {
-      scheduleId: announcement.scheduleId,
-      occurrenceDate: announcement.occurrenceDate,
-      jobName: announcement.jobName,
-      timezone: announcement.timezone,
-    }),
-  });
 }
 
 async function publishHome(client, userId) {
@@ -240,9 +152,11 @@ function parseMetadata(rawValue) {
 function mapValidationErrorsToSlack(fieldErrors) {
   const mapping = {
     name: BLOCK_IDS.name,
+    type: BLOCK_IDS.type,
     mode: BLOCK_IDS.mode,
     timezone: BLOCK_IDS.timezone,
     weekday: BLOCK_IDS.weekday,
+    weekdays: BLOCK_IDS.weekday,
     time: BLOCK_IDS.time,
     cron: BLOCK_IDS.cron,
     message: BLOCK_IDS.message,
@@ -260,7 +174,9 @@ app.command("/yoga", async ({ command, ack, respond, client }) => {
 
   const text = String(command.text || "").trim();
 
-  if (text.startsWith("open")) {
+  const subcommand = text.split(/\s+/)[0];
+
+  if (subcommand === "open") {
     const detail = text.replace(/^open/, "").trim();
     if (!detail) {
       await respond({
@@ -270,28 +186,19 @@ app.command("/yoga", async ({ command, ack, respond, client }) => {
       return;
     }
 
-    const context = createManualAnnouncementContext(detail);
-    await postAnnouncement({
-      channel: command.channel_id,
-      detail,
-      context,
-    });
+    await announcementService.send({
+      id: `manual:${crypto.randomUUID()}`, type: "class", name: detail.slice(0, 100),
+      message: detail, timezone: DEFAULT_TIMEZONE,
+      target: command.channel_id === TEST_CHANNEL_ID ? "test" : "production",
+    }, { channel: command.channel_id });
     return;
   }
 
-  if (text.startsWith("test")) {
-    if (!TEST_CHANNEL_ID) {
-      await respond({
-        text: "`SLACK_TEST_CHANNEL_ID`를 설정해 주세요.",
-        response_type: "ephemeral",
-      });
-      return;
-    }
-
+  if (subcommand === "send" || subcommand === "test") {
     const schedules = scheduleStore.list();
     if (schedules.length === 0) {
       await respond({
-        text: "테스트할 저장된 스케줄이 아직 없어요.",
+        text: "발송할 저장된 스케줄이 아직 없어요.",
         response_type: "ephemeral",
       });
       return;
@@ -299,15 +206,16 @@ app.command("/yoga", async ({ command, ack, respond, client }) => {
 
     await client.views.open({
       trigger_id: command.trigger_id,
-      view: buildTestPickerModalView({
+      view: buildSendModalView({
         schedules: getDecoratedSchedules(),
         requestChannelId: command.channel_id,
+        target: subcommand === "test" || command.channel_id === TEST_CHANNEL_ID ? "test" : "production",
       }),
     });
     return;
   }
 
-  if (text.startsWith("schedule")) {
+  if (subcommand === "schedule") {
     if (!isAdminUser(command.user_id, ADMIN_USER_IDS)) {
       await respond({
         text: "이 기능은 스케줄 관리자만 사용할 수 있어요.",
@@ -336,7 +244,7 @@ app.command("/yoga", async ({ command, ack, respond, client }) => {
   await respond({
     text:
       "사용법: `/yoga open <시간> <클래스>`\n" +
-      "테스트: `/yoga test`\n" +
+      "즉시 발송: `/yoga send`\n" +
       "스케줄 관리: `/yoga schedule`",
     response_type: "ephemeral",
   });
@@ -373,75 +281,29 @@ async function handleAttendanceAction({ ack, body, client, status }) {
   if (!channelId || !user.id || !context) return;
 
   try {
-    await attendanceService.appendAttendance({
-      occurrenceDate: context.occurrenceDate,
-      scheduleId: context.scheduleId,
-      jobName: context.jobName || "Yoga",
-      userId: user.id,
-      userName: user.username || user.name || user.id,
-      status,
-      timezone: context.timezone || DEFAULT_TIMEZONE,
-    });
-
+    const result = await announcementService.participate(context, user, status,
+      action.action_ts ? `${user.id}:${action.action_id}:${action.action_ts}` : null);
+    if (result.duplicate) return;
+    const cancelled = result.status === "cancelled" || result.status === "absent";
+    let text = context.type === "habit"
+      ? (cancelled ? "실천 기록을 취소했어요." : "실천 기록을 저장했어요.")
+      : (cancelled ? "취소가 완료됐어요." : "참석 등록이 완료됐어요.");
+    if (result.refreshFailed) text += " 기록은 저장됐지만 공지 목록을 갱신하지 못했어요.";
     await client.chat.postEphemeral({
-      channel: channelId,
-      user: user.id,
-      blocks: buildCancelBlocks(context),
-      text: "참석 등록이 완료됐어요.",
+      channel: channelId, user: user.id, text,
+      ...(context.type !== "habit" && !cancelled ? { blocks: buildCancelBlocks(context) } : {}),
     });
-
-    await updateAnnouncementWithAttendees(client, context);
   } catch (error) {
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: user.id,
-      text: `참석 등록에 실패했어요: ${error.message}`,
-    });
+    await client.chat.postEphemeral({ channel: channelId, user: user.id,
+      text: `참여 기록을 변경하지 못했어요: ${error.message}` });
   }
 }
 
-app.action("yoga_attend", async ({ ack, body, client }) => {
-  await handleAttendanceAction({ ack, body, client, status: "attend" });
-});
-
-app.action("yoga_late", async ({ ack, body, client }) => {
-  await handleAttendanceAction({ ack, body, client, status: "late" });
-});
-
-app.action("yoga_cancel", async ({ ack, body, client }) => {
-  await ack();
-
-  const channelId = body.channel && body.channel.id;
-  const user = body.user || {};
-  const action = body.actions && body.actions[0];
-  const context = action && decodeAnnouncementContext(action.value);
-
-  if (!channelId || !user.id || !context) return;
-
-  try {
-    const removed = await attendanceService.deleteAttendance({
-      occurrenceDate: context.occurrenceDate,
-      scheduleId: context.scheduleId,
-      userId: user.id,
-    });
-
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: user.id,
-      text: removed ? "취소가 완료됐어요." : "이미 취소되었거나 신청 내역이 없어요.",
-    });
-
-    if (removed) {
-      await updateAnnouncementWithAttendees(client, context);
-    }
-  } catch (error) {
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: user.id,
-      text: `취소에 실패했어요: ${error.message}`,
-    });
-  }
-});
+for (const [actionId, status] of Object.entries({
+  yoga_attend: "attend", yoga_late: "late", yoga_cancel: "cancelled", yoga_habit: "toggle",
+})) {
+  app.action(actionId, async (args) => handleAttendanceAction({ ...args, status }));
+}
 
 app.event("app_home_opened", async ({ event, client }) => {
   await publishHome(client, event.user);
@@ -518,7 +380,7 @@ app.action(ACTION_IDS.scheduleModeChanged, async ({ ack, body, action, client })
   draft.mode = action.selected_option && action.selected_option.value === "cron" ? "cron" : "weekly";
 
   if (draft.mode === "cron") {
-    draft.weekday = "monday";
+    draft.weekdays = [];
     draft.time = "";
   } else {
     draft.cron = "";
@@ -575,13 +437,13 @@ app.view(CALLBACK_IDS.scheduleAdd, async ({ ack, body, view, client }) => {
   }
 });
 
-app.view(CALLBACK_IDS.scheduleTest, async ({ ack, body, view, client }) => {
-  const scheduleId = extractTestScheduleSelection(view);
+app.view(CALLBACK_IDS.scheduleSend, async ({ ack, body, view, client }) => {
+  const { scheduleId, target } = extractSendSelection(view);
   if (!scheduleId) {
     await ack({
       response_action: "errors",
       errors: {
-        [BLOCK_IDS.testSchedule]: "Choose a saved schedule.",
+        [BLOCK_IDS.sendSchedule]: "Choose a saved schedule.",
       },
     });
     return;
@@ -592,23 +454,28 @@ app.view(CALLBACK_IDS.scheduleTest, async ({ ack, body, view, client }) => {
     await ack({
       response_action: "errors",
       errors: {
-        [BLOCK_IDS.testSchedule]: "That schedule no longer exists.",
+        [BLOCK_IDS.sendSchedule]: "That schedule no longer exists.",
       },
     });
+    return;
+  }
+
+  if (!["production", "test"].includes(target) || !resolveScheduleChannel(target)) {
+    await ack({ response_action: "errors", errors: { [BLOCK_IDS.target]: "발송할 채널 설정을 확인해 주세요." } });
     return;
   }
 
   await ack();
 
   try {
-    await postScheduleToTestChannel(schedule);
+    await announcementService.send(schedule, { target });
 
     const metadata = parseMetadata(view.private_metadata);
     if (metadata.requestChannelId) {
       await client.chat.postEphemeral({
         channel: metadata.requestChannelId,
         user: body.user.id,
-        text: `테스트 메시지를 발송했습니다. (${schedule.name} / <#${TEST_CHANNEL_ID}>)`,
+        text: `메시지를 발송했습니다. (${schedule.name} / <#${resolveScheduleChannel(target)}>)`,
       });
     }
   } catch (error) {
@@ -617,7 +484,7 @@ app.view(CALLBACK_IDS.scheduleTest, async ({ ack, body, view, client }) => {
       await client.chat.postEphemeral({
         channel: metadata.requestChannelId,
         user: body.user.id,
-        text: `테스트 메시지 발송에 실패했어요: ${error.message}`,
+        text: `메시지 발송에 실패했어요: ${error.message}`,
       });
     }
   }

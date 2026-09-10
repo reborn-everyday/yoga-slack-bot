@@ -106,8 +106,8 @@ test("admin handler requires auth and supports create/list/toggle/delete", async
       name: "Lunch Yoga Monday",
       timezone: "Asia/Seoul",
       mode: "weekly",
-      weekday: "monday",
-      time: "09:00",
+      weekdays: ["monday", "wednesday", "friday"],
+      time: "09:35",
       cron: "",
       message: "Monday lunch class",
       target: "real",
@@ -128,7 +128,9 @@ test("admin handler requires auth and supports create/list/toggle/delete", async
   assert.equal(response.statusCode, 200);
   const schedules = JSON.parse(response.body);
   assert.equal(schedules.length, 1);
-  assert.equal(schedules[0].weekday, "monday");
+  assert.deepEqual(schedules[0].weekdays, ["monday", "wednesday", "friday"]);
+  assert.equal(schedules[0].time, "09:35");
+  assert.equal(schedules[0].cron, "35 9 * * 1,3,5");
   assert.equal(schedules[0].target, "production");
 
   response = await invoke(handler, {

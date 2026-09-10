@@ -15,11 +15,11 @@ function logStartupWarnings({
   const warnings = [];
 
   if (!productionChannelId) {
-    warnings.push("⚠️ SLACK_CHANNEL_ID is missing. Production schedules will be skipped.");
+    warnings.push("⚠️ SLACK_CHANNEL_ID is missing. Sending to the production environment is unavailable.");
   }
 
   if (!testChannelId) {
-    warnings.push("⚠️ SLACK_TEST_CHANNEL_ID is missing. Test schedules and /yoga test will be unavailable.");
+    warnings.push("⚠️ SLACK_TEST_CHANNEL_ID is missing. Sending to the test environment is unavailable.");
   }
 
   if (!adminPassword) {

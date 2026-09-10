@@ -7,7 +7,7 @@
     "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js",
     "start": "node index.js",
     "start:insecure": "NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",

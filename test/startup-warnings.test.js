@@ -36,8 +36,8 @@ test("logStartupWarnings covers the boot-time missing-config cases with producti
   });
 
   assert.deepEqual(warnings, [
-    "⚠️ SLACK_CHANNEL_ID is missing. Production schedules will be skipped.",
-    "⚠️ SLACK_TEST_CHANNEL_ID is missing. Test schedules and /yoga test will be unavailable.",
+    "⚠️ SLACK_CHANNEL_ID is missing. Sending to the production environment is unavailable.",
+    "⚠️ SLACK_TEST_CHANNEL_ID is missing. Sending to the test environment is unavailable.",
     "⚠️ ADMIN_PASSWORD is missing. The built-in admin page will reject logins.",
     "⚠️ SCHEDULE_ADMIN_USER_IDS is empty. Slack schedule management is disabled.",
   ]);

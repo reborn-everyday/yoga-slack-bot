@@ -1,3 +1,5 @@
+const { SCHEDULE_TYPES, normalizeWeekdays } = require("./schedule-store");
+
 const ACTION_IDS = {
   scheduleAdminAddOpen: "schedule_admin_add_open",
   scheduleAdminDelete: "schedule_admin_delete",
@@ -7,7 +9,7 @@ const ACTION_IDS = {
 
 const CALLBACK_IDS = {
   scheduleAdd: "schedule_admin_add_view",
-  scheduleTest: "schedule_test_view",
+  scheduleSend: "schedule_send_view",
 };
 
 const BLOCK_IDS = {
@@ -15,8 +17,9 @@ const BLOCK_IDS = {
   message: "schedule_message",
   mode: "schedule_mode",
   name: "schedule_name",
+  type: "schedule_type",
   target: "schedule_target",
-  testSchedule: "test_schedule",
+  sendSchedule: "send_schedule",
   time: "schedule_time",
   timezone: "schedule_timezone",
   weekday: "schedule_weekday",
@@ -107,7 +110,7 @@ function buildScheduleBlocks(schedules) {
         text: {
           type: "mrkdwn",
           text: [
-            `*${schedule.name}*`,
+            `*${schedule.name}* · ${SCHEDULE_TYPES[schedule.type || "class"]}`,
             `*schedule:* ${getScheduleDisplayText(schedule)}`,
             `*timezone:* ${schedule.timezone}`,
             `*channel:* ${getSlackChannelDisplay(schedule)}`,
@@ -228,14 +231,15 @@ function buildAdminHomeView({ schedules, authorized }) {
 
 function getDefaultDraft(defaultTimezone = "Asia/Seoul") {
   return {
+    type: "class",
     cron: "",
     message: "",
     mode: "weekly",
     name: "",
     target: "production",
-    time: "",
+    time: "09:00",
     timezone: defaultTimezone,
-    weekday: "monday",
+    weekdays: ["monday"],
   };
 }
 
@@ -244,6 +248,8 @@ function normalizeDraftValues(values = {}, defaultTimezone = "Asia/Seoul") {
   return {
     ...getDefaultDraft(defaultTimezone),
     ...values,
+    weekdays: normalizeWeekdays(values.weekdays ?? values.weekday ?? ["monday"]),
+    type: Object.hasOwn(SCHEDULE_TYPES, values.type) ? values.type : "class",
     mode: values.mode === "cron" ? "cron" : "weekly",
     target: normalizedTarget === "test" ? "test" : "production",
     timezone: ["Asia/Seoul", "UTC"].includes(values.timezone) ? values.timezone : defaultTimezone,
@@ -288,27 +294,28 @@ function buildWeeklyInputs(values) {
     {
       type: "input",
       block_id: BLOCK_IDS.weekday,
-      label: { type: "plain_text", text: "Day of the week" },
+      label: { type: "plain_text", text: "요일 (여러 개 선택 가능)" },
       element: {
-        type: "static_select",
+        type: "checkboxes",
         action_id: "value",
-        initial_option: getStaticSelectOption(
-          WEEKDAY_OPTIONS,
-          values.weekday,
-          values.weekday || "monday"
-        ),
+        ...(values.weekdays.length ? { initial_options: WEEKDAY_OPTIONS
+          .filter((option) => values.weekdays.includes(option.value))
+          .map((option) => optionFor(option.value, option.label)) } : {}),
         options: WEEKDAY_OPTIONS.map((option) => optionFor(option.value, option.label)),
       },
     },
     {
       type: "input",
       block_id: BLOCK_IDS.time,
-      label: { type: "plain_text", text: "Time" },
+      label: { type: "plain_text", text: "시간 (HH:mm)" },
+      hint: { type: "plain_text", text: "24시간 형식으로 분까지 입력해 주세요. 예: 09:35, 18:07" },
       element: {
-        type: "timepicker",
+        type: "plain_text_input",
         action_id: "value",
-        placeholder: { type: "plain_text", text: "09:00" },
-        ...(values.time ? { initial_time: values.time } : {}),
+        placeholder: { type: "plain_text", text: "09:35" },
+        min_length: 5,
+        max_length: 5,
+        initial_value: values.time || "",
       },
     },
   ];
@@ -343,7 +350,16 @@ function buildAddScheduleModalView({
         type: "plain_text_input",
         action_id: "value",
         initial_value: draft.name,
+        max_length: 100,
         placeholder: { type: "plain_text", text: "Lunch Yoga Monday" },
+      },
+    },
+    {
+      type: "input", block_id: BLOCK_IDS.type,
+      label: { type: "plain_text", text: "일정 유형" },
+      element: { type: "static_select", action_id: "value",
+        initial_option: optionFor(draft.type, SCHEDULE_TYPES[draft.type]),
+        options: Object.entries(SCHEDULE_TYPES).map(([value, label]) => optionFor(value, label)),
       },
     },
     buildModeInput(draft),
@@ -352,36 +368,19 @@ function buildAddScheduleModalView({
     {
       type: "input",
       block_id: BLOCK_IDS.message,
+      optional: true,
+      hint: { type: "plain_text", text: "수업·생활습관은 필수입니다. 주간 동향은 안내 문구이며 순위는 자동으로 생성됩니다." },
       label: { type: "plain_text", text: "Message" },
       element: {
         type: "plain_text_input",
         action_id: "value",
         initial_value: draft.message,
+        max_length: 2500,
         multiline: true,
         placeholder: { type: "plain_text", text: "아쉬탕가 @ 11:30, 4층 Idea Hub" },
       },
     },
-    {
-      type: "input",
-      block_id: BLOCK_IDS.target,
-      label: { type: "plain_text", text: "Slack channel target" },
-      element: {
-        type: "static_select",
-        action_id: "value",
-        initial_option: getStaticSelectOption(
-          [
-            { label: "Production Channel", value: "production" },
-            { label: "Test Channel", value: "test" },
-          ],
-          draft.target,
-          draft.target === "test" ? "Test Channel" : "Production Channel"
-        ),
-        options: [
-          optionFor("production", "Production Channel"),
-          optionFor("test", "Test Channel"),
-        ],
-      },
-    },
+    buildTargetInput(draft.target),
   ];
 
   return {
@@ -395,35 +394,36 @@ function buildAddScheduleModalView({
   };
 }
 
-function buildTestPickerModalView({ schedules, requestChannelId }) {
+function buildTargetInput(target) {
   return {
-    type: "modal",
-    callback_id: CALLBACK_IDS.scheduleTest,
+    type: "input", block_id: BLOCK_IDS.target,
+    label: { type: "plain_text", text: "발송 채널" },
+    element: { type: "static_select", action_id: "value",
+      initial_option: optionFor(target, target === "test" ? "Test Channel" : "Production Channel"),
+      options: [optionFor("production", "Production Channel"), optionFor("test", "Test Channel")],
+    },
+  };
+}
+
+function buildSendModalView({ schedules, requestChannelId, target = "production" }) {
+  return {
+    type: "modal", callback_id: CALLBACK_IDS.scheduleSend,
     private_metadata: JSON.stringify({ requestChannelId }),
-    title: { type: "plain_text", text: "Test Schedule" },
-    submit: { type: "plain_text", text: "Send" },
-    close: { type: "plain_text", text: "Cancel" },
+    title: { type: "plain_text", text: "즉시 발송" },
+    submit: { type: "plain_text", text: "발송" },
+    close: { type: "plain_text", text: "취소" },
     blocks: [
       {
-        type: "input",
-        block_id: BLOCK_IDS.testSchedule,
-        label: { type: "plain_text", text: "Saved schedule" },
-        element: {
-          type: "static_select",
-          action_id: "value",
-          placeholder: { type: "plain_text", text: "Choose a schedule" },
-          options: schedules.map((schedule) => ({
-            text: {
-              type: "plain_text",
-              text: truncateText(
-                `name: ${schedule.name} | status: ${schedule.enabled ? "on" : "off"}`,
-                75
-              ),
-            },
-            value: schedule.id,
-          })),
+        type: "input", block_id: BLOCK_IDS.sendSchedule,
+        label: { type: "plain_text", text: "일정 선택" },
+        element: { type: "static_select", action_id: "value",
+          placeholder: { type: "plain_text", text: "수업·생활습관·주간 동향" },
+          options: schedules.map((schedule) => optionFor(schedule.id,
+            truncateText(`${SCHEDULE_TYPES[schedule.type || "class"]} · ${schedule.name}`, 75))),
         },
       },
+      buildTargetInput(target),
+      { type: "context", elements: [{ type: "mrkdwn", text: "선택한 채널에 지금 한 번 발송합니다. 예약 일정은 그대로 유지됩니다." }] },
     ],
   };
 }
@@ -434,8 +434,11 @@ function getStateAction(values, blockId, actionId = "value") {
 
 function extractScheduleDraftFromState(stateValues, defaultTimezone = "Asia/Seoul") {
   const values = stateValues || {};
+  const days = getStateAction(values, BLOCK_IDS.weekday) || {};
+  const time = getStateAction(values, BLOCK_IDS.time) || {};
   return normalizeDraftValues(
     {
+      type: ((getStateAction(values, BLOCK_IDS.type) || {}).selected_option || {}).value || "class",
       cron: (getStateAction(values, BLOCK_IDS.cron) || {}).value || "",
       message: (getStateAction(values, BLOCK_IDS.message) || {}).value || "",
       mode:
@@ -443,9 +446,10 @@ function extractScheduleDraftFromState(stateValues, defaultTimezone = "Asia/Seou
           .value || "",
       name: (getStateAction(values, BLOCK_IDS.name) || {}).value || "",
       target: ((getStateAction(values, BLOCK_IDS.target) || {}).selected_option || {}).value || "",
-      time: (getStateAction(values, BLOCK_IDS.time) || {}).selected_time || "",
+      time: time.value ?? time.selected_time ?? "",
       timezone: ((getStateAction(values, BLOCK_IDS.timezone) || {}).selected_option || {}).value || "",
-      weekday: ((getStateAction(values, BLOCK_IDS.weekday) || {}).selected_option || {}).value || "",
+      weekdays: days.selected_options?.map((option) => option.value)
+        ?? (days.selected_option ? [days.selected_option.value] : []),
     },
     defaultTimezone
   );
@@ -455,13 +459,12 @@ function extractScheduleFormValues(view, defaultTimezone = "Asia/Seoul") {
   return extractScheduleDraftFromState(view.state.values, defaultTimezone);
 }
 
-function extractTestScheduleSelection(view) {
-  return (
-    view.state.values[BLOCK_IDS.testSchedule] &&
-    view.state.values[BLOCK_IDS.testSchedule].value &&
-    view.state.values[BLOCK_IDS.testSchedule].value.selected_option &&
-    view.state.values[BLOCK_IDS.testSchedule].value.selected_option.value
-  );
+function extractSendSelection(view) {
+  const values = view.state.values;
+  return {
+    scheduleId: getStateAction(values, BLOCK_IDS.sendSchedule)?.selected_option?.value,
+    target: getStateAction(values, BLOCK_IDS.target)?.selected_option?.value,
+  };
 }
 
 module.exports = {
@@ -473,10 +476,10 @@ module.exports = {
   buildAddScheduleModalView,
   buildAdminHomeView,
   buildScheduleAdminModalView,
-  buildTestPickerModalView,
+  buildSendModalView,
   extractScheduleDraftFromState,
   extractScheduleFormValues,
-  extractTestScheduleSelection,
+  extractSendSelection,
   getDefaultDraft,
   isAdminUser,
   parseAdminUserIds,

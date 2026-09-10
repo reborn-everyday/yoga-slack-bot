@@ -9,6 +9,7 @@ const {
 } = require("./utils");
 
 const VALID_TARGETS = new Set(["production", "test"]);
+const SCHEDULE_TYPES = { class: "수업", habit: "생활습관", report: "주간 동향" };
 const CREATE_TIMEZONE_OPTIONS = ["Asia/Seoul", "UTC"];
 const ALLOWED_CREATE_TIMEZONES = new Set(CREATE_TIMEZONE_OPTIONS);
 const WEEKDAY_OPTIONS = [
@@ -62,9 +63,16 @@ function isValidTimeValue(value) {
   return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(value || "").trim());
 }
 
-function buildWeeklyCron(weekday, time) {
+function normalizeWeekdays(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return [...new Set(values.map((day) => String(day).trim().toLowerCase()))]
+    .sort((a, b) => WEEKDAY_OPTIONS.indexOf(a) - WEEKDAY_OPTIONS.indexOf(b));
+}
+
+function buildWeeklyCron(weekdays, time) {
   const [hour, minute] = String(time).split(":").map(Number);
-  return `${minute} ${hour} * * ${WEEKDAY_TO_CRON[weekday]}`;
+  const days = normalizeWeekdays(weekdays).map((day) => WEEKDAY_TO_CRON[day]).join(",");
+  return `${minute} ${hour} * * ${days}`;
 }
 
 function parseWeeklyCron(cronExpression) {
@@ -73,19 +81,21 @@ function parseWeeklyCron(cronExpression) {
 
   const [minuteRaw, hourRaw, dayOfMonth, month, dayOfWeekRaw] = parts;
   if (dayOfMonth !== "*" || month !== "*") return null;
-  if (!/^\d+$/.test(minuteRaw) || !/^\d+$/.test(hourRaw) || !/^\d+$/.test(dayOfWeekRaw)) {
+  if (!/^\d+$/.test(minuteRaw) || !/^\d+$/.test(hourRaw) || !/^(?:[0-7](?:,[0-7])*|\*)$/.test(dayOfWeekRaw)) {
     return null;
   }
 
   const minute = Number(minuteRaw);
   const hour = Number(hourRaw);
-  const weekday = CRON_TO_WEEKDAY[dayOfWeekRaw];
-  if (!weekday || minute < 0 || minute > 59 || hour < 0 || hour > 23) {
+  const weekdays = dayOfWeekRaw === "*" ? [...WEEKDAY_OPTIONS]
+    : normalizeWeekdays(dayOfWeekRaw.split(",").map((day) => CRON_TO_WEEKDAY[day]));
+  if (minute < 0 || minute > 59 || hour < 0 || hour > 23) {
     return null;
   }
 
   return {
-    weekday,
+    weekdays,
+    weekday: weekdays.length === 1 ? weekdays[0] : "",
     time: `${padTimeUnit(hour)}:${padTimeUnit(minute)}`,
   };
 }
@@ -100,6 +110,8 @@ function normalizePersistedScheduleRecord(record) {
   const cronExpression = String(record.cron || "").trim();
   const message = String(record.message || "").trim();
   const target = normalizeTargetValue(record.target);
+  const type = record.type || "class";
+  if (!Object.hasOwn(SCHEDULE_TYPES, type)) throw new Error("Invalid schedule type.");
 
   if (!name) throw new Error("Schedule store contains a record without name.");
   if (!timezone || !validateTimeZone(timezone)) {
@@ -108,7 +120,7 @@ function normalizePersistedScheduleRecord(record) {
   if (!cronExpression || !cron.validate(cronExpression)) {
     throw new Error(`Schedule ${record.id || "<unknown>"} has an invalid cron expression.`);
   }
-  if (!message) throw new Error(`Schedule ${record.id || "<unknown>"} is missing a message.`);
+  if (!message && type !== "report") throw new Error(`Schedule ${record.id || "<unknown>"} is missing a message.`);
   if (!VALID_TARGETS.has(target)) {
     throw new Error(`Schedule ${record.id || "<unknown>"} has an invalid target.`);
   }
@@ -124,6 +136,7 @@ function normalizePersistedScheduleRecord(record) {
 
   return {
     id: record.id,
+    type,
     name,
     timezone,
     cron: cronExpression,
@@ -173,15 +186,19 @@ function loadScheduleRecords(filePath, label) {
 
 function validateScheduleInput(input) {
   const fieldErrors = {};
+  const type = input.type || "class";
+  if (!Object.hasOwn(SCHEDULE_TYPES, type)) fieldErrors.type = "일정 유형을 선택해 주세요.";
   const name = String(input.name || "").trim();
   const timezone = String(input.timezone || "").trim();
   const cronExpression = String(input.cron || "").trim();
-  const weekday = String(input.weekday || "").trim().toLowerCase();
+  // Accept the previous single-day API while new forms submit an array.
+  const weekdayField = input.weekdays !== undefined ? "weekdays" : "weekday";
+  const weekdays = normalizeWeekdays(input.weekdays ?? input.weekday);
   const time = String(input.time || "").trim();
   const message = String(input.message || "").trim();
   const target = normalizeTargetValue(input.target);
   const inputMode = String(input.mode || "").trim().toLowerCase();
-  const hasWeeklyInput = Boolean(weekday || time);
+  const hasWeeklyInput = Boolean(weekdays.length || time);
   const hasCronInput = Boolean(cronExpression);
 
   if (!name) fieldErrors.name = "Job name is required.";
@@ -196,22 +213,22 @@ function validateScheduleInput(input) {
   }
 
   if (hasWeeklyInput && hasCronInput) {
-    fieldErrors.weekday = "Provide either weekday/time or cron, not both.";
+    fieldErrors[weekdayField] = "Provide either weekday/time or cron, not both.";
     fieldErrors.time = "Provide either weekday/time or cron, not both.";
     fieldErrors.cron = "Provide either weekday/time or cron, not both.";
   } else if (!hasWeeklyInput && !hasCronInput) {
     fieldErrors.mode = "Provide either weekday/time or cron.";
   } else if (hasWeeklyInput) {
-    if (!weekday) {
-      fieldErrors.weekday = "Day of the week is required for weekly schedules.";
-    } else if (!VALID_WEEKDAYS.has(weekday)) {
-      fieldErrors.weekday = "Day of the week is invalid.";
+    if (!weekdays.length) {
+      fieldErrors[weekdayField] = "요일을 하나 이상 선택해 주세요.";
+    } else if (weekdays.some((day) => !VALID_WEEKDAYS.has(day))) {
+      fieldErrors[weekdayField] = "선택한 요일이 올바르지 않습니다.";
     }
 
     if (!time) {
       fieldErrors.time = "Time is required for weekly schedules.";
     } else if (!isValidTimeValue(time)) {
-      fieldErrors.time = "Time must be in HH:mm format.";
+      fieldErrors.time = "24시간 형식 HH:mm으로 입력해 주세요. 예: 09:35 (00:00~23:59)";
     }
   } else if (hasCronInput && !cron.validate(cronExpression)) {
     fieldErrors.cron = "Cron expression is invalid.";
@@ -221,11 +238,17 @@ function validateScheduleInput(input) {
     fieldErrors.cron = "Cron must be empty when weekly mode is selected.";
   }
   if (inputMode === "cron" && hasWeeklyInput) {
-    fieldErrors.weekday = "Weekly fields must be empty when cron mode is selected.";
+    fieldErrors[weekdayField] = "Weekly fields must be empty when cron mode is selected.";
     fieldErrors.time = "Weekly fields must be empty when cron mode is selected.";
   }
 
-  if (!message) fieldErrors.message = "Message is required.";
+  if (input.weekdays !== undefined && !Array.isArray(input.weekdays)) {
+    fieldErrors.weekdays = "요일은 목록으로 입력해 주세요.";
+  }
+
+  if (!message && type !== "report") fieldErrors.message = "Message is required.";
+  if (message.length > 2500) fieldErrors.message = "Message must be at most 2500 characters.";
+  if (name.length > 100) fieldErrors.name = "Job name must be at most 100 characters.";
   if (!target) {
     fieldErrors.target = "Target channel is required.";
   } else if (!VALID_TARGETS.has(target)) {
@@ -237,9 +260,10 @@ function validateScheduleInput(input) {
   }
 
   return {
+    type,
     name,
     timezone,
-    cron: hasCronInput ? cronExpression : buildWeeklyCron(weekday, time),
+    cron: hasCronInput ? cronExpression : buildWeeklyCron(weekdays, time),
     message,
     target,
   };
@@ -255,9 +279,10 @@ function describeSchedule(schedule, resolveChannelId) {
     channelId: channelId || "",
     channelDisplay: targetLabel,
     scheduleMode: weekly ? "weekly" : "cron",
+    weekdays: weekly ? weekly.weekdays : [],
     weekday: weekly ? weekly.weekday : "",
     time: weekly ? weekly.time : "",
-    weeklyLabel: weekly ? `${capitalize(weekly.weekday)} ${weekly.time}` : "",
+    weeklyLabel: weekly ? `${weekly.weekdays.map(capitalize).join(", ")} ${weekly.time}` : "",
   };
 }
 
@@ -366,6 +391,7 @@ class ScheduleStore {
 }
 
 module.exports = {
+  SCHEDULE_TYPES,
   CREATE_TIMEZONE_OPTIONS,
   ScheduleStore,
   VALID_WEEKDAYS,
@@ -374,6 +400,7 @@ module.exports = {
   createValidationError,
   describeSchedule,
   normalizeTargetValue,
+  normalizeWeekdays,
   normalizePersistedScheduleRecord,
   parseWeeklyCron,
   validateScheduleInput,

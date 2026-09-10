@@ -8,6 +8,8 @@ const {
   ScheduleStore,
   describeSchedule,
   validateScheduleInput,
+  parseWeeklyCron,
+  WEEKDAY_OPTIONS,
 } = require("../src/schedule-store");
 
 function createTempDir() {
@@ -131,6 +133,64 @@ test("validateScheduleInput rejects invalid combinations", () => {
       return true;
     }
   );
+});
+
+test("multiple weekly days persist as a single cron with minute precision", () => {
+  const dir = createTempDir();
+  try {
+    const filePath = path.join(dir, "schedules.json");
+    const store = new ScheduleStore({ filePath });
+    for (const type of ["class", "habit", "report"]) {
+      const row = store.create({ type, name: type, message: "안내", timezone: "Asia/Seoul", target: "test",
+        mode: "weekly", weekdays: ["friday", "monday", "wednesday", "monday"], time: "18:07" });
+      assert.equal(row.cron, "7 18 * * 1,3,5");
+    }
+    const rows = new ScheduleStore({ filePath }).list().map((row) => describeSchedule(row));
+    assert.equal(rows.length, 3);
+    for (const row of rows) {
+      assert.equal(row.scheduleMode, "weekly");
+      assert.deepEqual(row.weekdays, ["monday", "wednesday", "friday"]);
+      assert.equal(row.weeklyLabel, "Monday, Wednesday, Friday 18:07");
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("daily and Sunday cron parsing, minute boundaries and weekly validation", () => {
+  const input = { name: "Yoga", message: "안내", timezone: "UTC", target: "production", mode: "weekly", weekdays: ["monday"] };
+  for (const [time, cron] of [["00:00", "0 0 * * 1"], ["09:35", "35 9 * * 1"], ["23:59", "59 23 * * 1"]]) {
+    assert.equal(validateScheduleInput({ ...input, time }).cron, cron);
+  }
+  const daily = validateScheduleInput({ ...input, weekdays: WEEKDAY_OPTIONS, time: "09:35" });
+  assert.deepEqual(parseWeeklyCron(daily.cron).weekdays, WEEKDAY_OPTIONS);
+  assert.deepEqual(parseWeeklyCron("35 9 * * *").weekdays, WEEKDAY_OPTIONS);
+  assert.deepEqual(parseWeeklyCron("35 9 * * 0,7").weekdays, ["sunday"]);
+  assert.equal(parseWeeklyCron("35 9 * * 8"), null);
+  assert.equal(parseWeeklyCron("*/5 9 * * 1,3"), null);
+  for (const time of ["24:00", "09:60", "9:35", "09:3", "09:35:00", "noon"]) {
+    assert.throws(() => validateScheduleInput({ ...input, time }), (error) => Boolean(error.fieldErrors.time));
+  }
+  for (const weekdays of [[], ["invalid"], ["monday", "invalid"], "monday"]) {
+    assert.throws(() => validateScheduleInput({ ...input, weekdays, time: "09:35" }), (error) => Boolean(error.fieldErrors.weekdays));
+  }
+  assert.throws(() => validateScheduleInput({ ...input, time: "09:35", cron: "0 9 * * *" }),
+    (error) => Boolean(error.fieldErrors.weekdays && error.fieldErrors.cron));
+  assert.equal(validateScheduleInput({ ...input, mode: "cron", weekdays: [], cron: "*/5 * * * *" }).cron, "*/5 * * * *");
+});
+
+test("all schedule types share persistence and validation, legacy rows default to class", () => {
+  const dir = createTempDir();
+  try {
+    const filePath = path.join(dir, "schedules.json");
+    const store = new ScheduleStore({ filePath });
+    const input = { name: "일정", timezone: "Asia/Seoul", mode: "weekly", weekday: "monday", time: "09:00", target: "production" };
+    store.create({ ...input, message: "수업" });
+    store.create({ ...input, type: "habit", message: "걷기" });
+    store.create({ ...input, type: "report", message: "" });
+    assert.deepEqual(new ScheduleStore({ filePath }).list().map((row) => row.type), ["class", "habit", "report"]);
+    assert.throws(() => store.create({ ...input, type: "habit" }), /Invalid schedule input/);
+    assert.throws(() => store.create({ ...input, type: "other", message: "x" }), /Invalid schedule input/);
+    assert.throws(() => store.create({ ...input, message: "x".repeat(2501) }), /Invalid schedule input/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("ScheduleStore accepts legacy real targets and rewrites them to production", () => {

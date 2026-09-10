@@ -32,9 +32,11 @@ docs/                 — Deployment documentation
 | `src/schedule-store.js`   | Persists schedules, validates weekly-vs-cron XOR input, sorts enabled first   |
 | `src/schedule-registry.js`| Registers enabled cron jobs and re-syncs them on create/toggle               |
 | `src/admin-server.js`     | Serves `/admin` and authenticated JSON APIs for create/list/toggle           |
-| `src/slack-admin.js`      | Builds App Home, admin modal, weekly-or-cron add modal, and test picker views |
+| `src/slack-admin.js`      | Builds App Home, admin modal, weekly-or-cron add modal, and a shared send picker for all schedule types |
 | `src/attendance-service.js` | Reads/writes Google Sheets and auto-adds `scheduleId` / `jobName` columns |
-| `src/announcement-store.js` | Tracks live announcement messages by `scheduleId + occurrenceDate`         |
+| `src/announcement-store.js` | Tracks each sent message by occurrence ID; reads legacy date keys |
+| `src/announcement-service.js` | Shared scheduled/manual send and participation flow for class, habit, report |
+| `src/habit-summary.js` | Pure weekly/monthly habit ranking calculation |
 
 ## User Flow
 
@@ -70,7 +72,8 @@ npm start          — Run in production mode
 | Command                       | Description                                          |
 |-------------------------------|------------------------------------------------------|
 | `/yoga open <time> <class>`   | Post class announcement to channel immediately       |
-| `/yoga test`                  | Pick a saved schedule and send it to the test channel |
+| `/yoga send`                  | Send any saved class/habit/report to either environment |
+| `/yoga test`                  | Alias of send with the test environment selected |
 | `/yoga schedule`              | Open the schedule admin modal (allowlisted users)     |
 
 ## Environment Variables
@@ -90,3 +93,9 @@ See `.env.example` for the full list. Key variables:
 ## Deployment
 
 Dockerized single-service deployment. See `docs/docker-deploy.md` for details.
+
+## Schedule types and habit data
+
+Schedules use `type: class | habit | report` (legacy default: `class`). All types share the store, registry, and `AnnouncementService.send`, including `/yoga send`. Habit participation is a one-button toggle stored in a separate `HabitParticipation` Sheets tab, keyed by environment + schedule + local date + user. Cancellation updates status rather than deleting history. Reports compute previous Monday–Sunday and month-to-date rankings, up to ten users with shared ranks and deterministic user-ID tie ordering. Runtime JSON stores message references; Sheets stores long-term records. No new runtime secrets or dependencies are required.
+
+Weekly forms use `weekdays` arrays (checkboxes) and typed 24-hour `HH:mm` times with minute precision. They compile into one comma-separated cron. The previous `weekday` API and persisted single-day cron remain compatible.
